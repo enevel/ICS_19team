@@ -1,4 +1,4 @@
-# openoperator-start-kit
+# openoperator-start-kit（懒得写md的19组）
 
 赛事官网->https://openoperator.cn
 
