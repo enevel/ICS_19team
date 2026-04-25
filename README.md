@@ -1,5 +1,7 @@
 # openoperator-start-kit（懒得写md的19组）
 
+Devin local test
+
 赛事官网->https://openoperator.cn
 
 此仓库是openoperator赛事举办方提供的模板仓库。选手可以直接Fork此仓库作为自己队伍的仓库。
