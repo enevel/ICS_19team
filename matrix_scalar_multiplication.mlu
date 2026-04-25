@@ -1,66 +1,65 @@
 #include <bang.h>
-#include <torch/extension.h>
 #include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
 
-#define CHUNK_SIZE 4096
+#define TILE_ELEMS 32768
+#define TASK_ELEMS (TILE_ELEMS * 16)
 
-__mlu_entry__ void mul_scalar_kernel(float *input, float *output, int total, float s) {
-    // 多核任务拆分参数
-    uint32_t core_id = taskId;
-    uint32_t core_num = taskDim;
-    uint32_t per_core = total / core_num;
-    uint32_t remainder = total % core_num;
+__mlu_entry__ void matrix_scalar_mul_kernel(const half *input,
+                                            half *output,
+                                            uint32_t total,
+                                            float scalar) {
+    uint32_t start = taskId * TASK_ELEMS;
+    if (start >= total) {
+        return;
+    }
 
-    // 计算当前 core 负责的数据起始位置和处理总数据量
-    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
-    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+    uint32_t remaining = total - start;
+    uint32_t count = remaining > TASK_ELEMS ? TASK_ELEMS : remaining;
 
-    if (count == 0) return;
+    __nram__ half buffer[TILE_ELEMS];
 
-    // NRAM 空间分配（片上高速缓存）
-    __nram__ float nram_buffer[CHUNK_SIZE];
+    for (uint32_t offset = 0; offset < count; offset += TILE_ELEMS) {
+        uint32_t len = count - offset;
+        if (len > TILE_ELEMS) {
+            len = TILE_ELEMS;
+        }
 
-    // 分块处理数据，适配 NRAM 容量限制
-    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
-        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
-
-        // Bang C 向量指令要求数据长度必须对齐到 64 个 float (256 字节)
-        uint32_t aligned_len = (len + 63) & ~63;
-
-        // 1. 从 GDRAM（全局显存）加载数据到 NRAM
-        __memcpy(nram_buffer, input + start + offset, len * sizeof(float), GDRAM2NRAM);
-
-        // 2. 执行向量与标量的乘法计算: buffer = buffer * s
-        __bang_mul_scalar(nram_buffer, nram_buffer, s, aligned_len);
-
-        // 3. 将计算结果从 NRAM 写回 GDRAM（只写回真实有效的长度，不包含对齐填充的部分）
-        __memcpy(output + start + offset, nram_buffer, len * sizeof(float), NRAM2GDRAM);
+        __memcpy(buffer,
+                 input + start + offset,
+                 len * sizeof(half),
+                 GDRAM2NRAM);
+        __bang_mul_scalar(buffer, buffer, (half)scalar, len);
+        __memcpy(output + start + offset,
+                 buffer,
+                 len * sizeof(half),
+                 NRAM2GDRAM);
     }
 }
 
-// 供外部调用的接口函数，名称必须为 bang_func
-torch::Tensor bang_func(torch::Tensor A, float s) {
-    // 确保输入张量在内存中是连续的，这是底层指针操作的前提
+torch::Tensor bang_func(torch::Tensor A, double s) {
     TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
+    TORCH_CHECK(A.scalar_type() == torch::kHalf, "Input tensor A must be float16");
+    TORCH_CHECK(A.numel() <= UINT32_MAX, "Input tensor A is too large");
 
-    // 分配与输入形状一致的输出显存空间
     auto output = torch::empty_like(A);
-    int total = A.numel(); // 直接获取张量包含的元素总数 (M * N)
+    uint32_t total = static_cast<uint32_t>(A.numel());
+    if (total == 0) {
+        return output;
+    }
 
-    // 获取当前 MLU 执行队列
+    uint32_t task_num = static_cast<uint32_t>(
+        (static_cast<uint64_t>(total) + TASK_ELEMS - 1) / TASK_ELEMS);
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 配置任务维度（此处配置为 4 核并行计算，可根据实际 MLU 型号调整）
-    cnrtDim3_t dim = {4, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
-
-    // 启动 Kernel 函数
-    mul_scalar_kernel<<<dim, ktype, queue>>>(
-        A.data_ptr<float>(),
-        output.data_ptr<float>(),
+    matrix_scalar_mul_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(A.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
         total,
-        s
-    );
+        static_cast<float>(s));
 
     return output;
 }
