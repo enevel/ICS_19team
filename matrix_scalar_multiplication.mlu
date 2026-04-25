@@ -1,0 +1,66 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#define CHUNK_SIZE 4096
+
+__mlu_entry__ void mul_scalar_kernel(float *input, float *output, int total, float s) {
+    // 多核任务拆分参数
+    uint32_t core_id = taskId;
+    uint32_t core_num = taskDim;
+    uint32_t per_core = total / core_num;
+    uint32_t remainder = total % core_num;
+
+    // 计算当前 core 负责的数据起始位置和处理总数据量
+    uint32_t start = core_id * per_core + (core_id < remainder ? core_id : remainder);
+    uint32_t count = per_core + (core_id < remainder ? 1 : 0);
+
+    if (count == 0) return;
+
+    // NRAM 空间分配（片上高速缓存）
+    __nram__ float nram_buffer[CHUNK_SIZE];
+
+    // 分块处理数据，适配 NRAM 容量限制
+    for (uint32_t offset = 0; offset < count; offset += CHUNK_SIZE) {
+        uint32_t len = (offset + CHUNK_SIZE <= count) ? CHUNK_SIZE : (count - offset);
+
+        // Bang C 向量指令要求数据长度必须对齐到 64 个 float (256 字节)
+        uint32_t aligned_len = (len + 63) & ~63;
+
+        // 1. 从 GDRAM（全局显存）加载数据到 NRAM
+        __memcpy(nram_buffer, input + start + offset, len * sizeof(float), GDRAM2NRAM);
+
+        // 2. 执行向量与标量的乘法计算: buffer = buffer * s
+        __bang_mul_scalar(nram_buffer, nram_buffer, s, aligned_len);
+
+        // 3. 将计算结果从 NRAM 写回 GDRAM（只写回真实有效的长度，不包含对齐填充的部分）
+        __memcpy(output + start + offset, nram_buffer, len * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+// 供外部调用的接口函数，名称必须为 bang_func
+torch::Tensor bang_func(torch::Tensor A, float s) {
+    // 确保输入张量在内存中是连续的，这是底层指针操作的前提
+    TORCH_CHECK(A.is_contiguous(), "Input tensor A must be contiguous");
+
+    // 分配与输入形状一致的输出显存空间
+    auto output = torch::empty_like(A);
+    int total = A.numel(); // 直接获取张量包含的元素总数 (M * N)
+
+    // 获取当前 MLU 执行队列
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 配置任务维度（此处配置为 4 核并行计算，可根据实际 MLU 型号调整）
+    cnrtDim3_t dim = {4, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeUnion1;
+
+    // 启动 Kernel 函数
+    mul_scalar_kernel<<<dim, ktype, queue>>>(
+        A.data_ptr<float>(),
+        output.data_ptr<float>(),
+        total,
+        s
+    );
+
+    return output;
+}
