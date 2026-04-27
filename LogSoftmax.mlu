@@ -1,0 +1,121 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define TILE_ELEMS 32768
+#define ALIGN_NUM 64
+
+__mlu_entry__ void log_softmax_kernel(const half *input,
+                                      half *output,
+                                      uint32_t batch_size,
+                                      uint32_t dim_size) {
+    __nram__ half nram_x[TILE_ELEMS];
+    __nram__ half nram_temp[TILE_ELEMS];
+
+    for (uint32_t b = taskId; b < batch_size; b += taskDim) {
+        const half *in_ptr = input + b * dim_size;
+        half *out_ptr = output + b * dim_size;
+
+        // Pass 1: 计算当前行的全局最大值 M (防溢出)
+        half global_max = -65504.0f; 
+        for (uint32_t offset = 0; offset < dim_size; offset += TILE_ELEMS) {
+            uint32_t len = (offset + TILE_ELEMS > dim_size) ? (dim_size - offset) : TILE_ELEMS;
+            __memcpy(nram_x, in_ptr + offset, len * sizeof(half), GDRAM2NRAM);
+            
+            half local_max = -65504.0f;
+            for(int i = 0; i < len; ++i) {
+                if(nram_x[i] > local_max) {
+                    local_max = nram_x[i];
+                }
+            }
+            if (local_max > global_max) {
+                global_max = local_max;
+            }
+        }
+
+        // Pass 2: 计算 exp(x - M) 并求全局和 Sum
+        float global_sum = 0.0f; 
+        for (uint32_t offset = 0; offset < dim_size; offset += TILE_ELEMS) {
+            uint32_t len = (offset + TILE_ELEMS > dim_size) ? (dim_size - offset) : TILE_ELEMS;
+            uint32_t align_len = (len + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
+
+            __memcpy(nram_x, in_ptr + offset, len * sizeof(half), GDRAM2NRAM);
+            
+            if (align_len > len) {
+                __bang_write_value(nram_x + len, align_len - len, global_max);
+            }
+            
+            __bang_sub_scalar(nram_x, nram_x, global_max, align_len);
+            
+            // Base-e 转 Base-2
+            __bang_mul_scalar(nram_x, nram_x, (half)1.44269504f, align_len);
+            __bang_active_exphp(nram_x, nram_x, align_len); 
+            
+            if (align_len > len) {
+                __bang_write_value(nram_x + len, align_len - len, (half)0.0f);
+            }
+            
+            __bang_reduce_sum(nram_temp, nram_x, align_len);
+            global_sum += (float)nram_temp[0];
+        }
+
+        // Pass 3: 计算最终 LogSoftmax 并写回 GDRAM
+        __bang_write_value(nram_temp, ALIGN_NUM, (half)1.0f);
+        nram_temp[0] = (half)global_sum;
+        
+        __bang_active_loghp(nram_temp, nram_temp, ALIGN_NUM); 
+        
+        // Base-2 转 Base-e
+        half log_global_sum = nram_temp[0] * (half)0.69314718f;
+
+        for (uint32_t offset = 0; offset < dim_size; offset += TILE_ELEMS) {
+            uint32_t len = (offset + TILE_ELEMS > dim_size) ? (dim_size - offset) : TILE_ELEMS;
+            uint32_t align_len = (len + ALIGN_NUM - 1) / ALIGN_NUM * ALIGN_NUM;
+
+            __memcpy(nram_x, in_ptr + offset, len * sizeof(half), GDRAM2NRAM);
+            
+            __bang_sub_scalar(nram_x, nram_x, global_max, align_len);
+            __bang_sub_scalar(nram_x, nram_x, log_global_sum, align_len);
+            
+            __memcpy(out_ptr + offset, nram_x, len * sizeof(half), NRAM2GDRAM);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor must be float16");
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D tensor [batch_size, dim]");
+
+    if (dim < 0) {
+        dim += x.dim();
+    }
+    TORCH_CHECK(dim == 0 || dim == 1, "dim must be 0 or 1");
+
+    bool need_transpose = (dim == 0);
+    auto input_work = need_transpose ? x.transpose(0, 1).contiguous() : x.contiguous();
+
+    uint32_t batch_size = static_cast<uint32_t>(input_work.size(0));
+    uint32_t dim_size = static_cast<uint32_t>(input_work.size(1));
+
+    auto output_work = torch::empty_like(input_work);
+
+    if (batch_size == 0 || dim_size == 0) {
+        return need_transpose ? output_work.transpose(0, 1).contiguous() : output_work;
+    }
+
+    uint32_t task_num = 16; 
+    if (batch_size < task_num) task_num = batch_size;
+    cnrtDim3_t grid_dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    log_softmax_kernel<<<grid_dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(input_work.data_ptr()),
+        reinterpret_cast<half *>(output_work.data_ptr()),
+        batch_size,
+        dim_size);
+
+    return need_transpose ? output_work.transpose(0, 1).contiguous() : output_work;
+}
