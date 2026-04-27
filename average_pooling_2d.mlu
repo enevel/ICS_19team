@@ -2,68 +2,68 @@
 #include <cnrt.h>
 #include <torch/extension.h>
 
-// ---------------------------------------------------------
-// 定义 NRAM 最大容量限制
-// 根据题目：W = 1024, kernel = 11。我们分配充足的空间。
-// ---------------------------------------------------------
-#define MAX_W 2048
-#define MAX_K 15
+// 针对这道题输入分辨率 (W=1024, K=11) 的常量宏
+#define MAX_W 1024
+#define MAX_K 11
+// 用于硬件向量指令对齐的最小单位 (64 的倍数)
+#define ALIGN_SIZE 128
 
 // ---------------------------------------------------------
-// BANG C 核函数：高精度 NCHW 二维平均池化
+// BANG C 核函数：1D 向量化加速版平均池化
 // ---------------------------------------------------------
-__mlu_entry__ void avgpool_kernel(const half* input, half* output,
-                                  int total_maps, int H, int W,
-                                  int H_out, int W_out,
-                                  int kernel_size) {
-    // NRAM 片上缓存空间 (总共占用约 90KB，远小于 512KB 上限，绝对安全)
-    __nram__ half nram_in_h[MAX_K * MAX_W];       // 存放载入的半精度输入数据
-    __nram__ float nram_in_f32[MAX_K * MAX_W];    // 升维后的单精度输入数据 (保证无损累加)
-    
-    __nram__ float nram_out_f32[MAX_W];           // 单精度输出行缓存
-    __nram__ half nram_out_h[MAX_W];              // 降维后的半精度输出行缓存
+__mlu_entry__ void avgpool_fast_kernel(const half* input, half* output,
+                                       int total_maps, int H, int W,
+                                       int H_out, int W_out,
+                                       int kernel_size) {
+    // NRAM 内存分配 (总计约 75KB，极其轻量安全)
+    __nram__ half nram_in_h[MAX_K * MAX_W];
+    __nram__ float nram_in_f[MAX_K * MAX_W];
+    __nram__ float nram_sum_f[MAX_W]; // 垂直压缩后的单行缓存
 
-    // 计算池化窗口的面积倒数 (用于求平均值)
+    // 输出缓存，分配 128 长度以满足硬件浮点转换指令的对齐要求
+    __nram__ float nram_out_f[ALIGN_SIZE];
+    __nram__ half nram_out_h[ALIGN_SIZE];
+
     float inv_k = 1.0f / (kernel_size * kernel_size);
 
-    // 并行策略：按 N*C (128个独立特征图) 分配给各个计算核心
     for (int map_idx = taskId; map_idx < total_maps; map_idx += taskDim) {
-        
-        // 定位当前处理的特征图指针
         const half* in_map = input + map_idx * H * W;
         half* out_map = output + map_idx * H_out * W_out;
 
-        // 遍历输出图的每一行
         for (int oy = 0; oy < H_out; ++oy) {
-            
-            // 当前输出行对应的输入起始行
-            int iy_start = oy * kernel_size; 
+            int iy_start = oy * kernel_size;
 
-            // 1. 【搬运】将涉及到的 kernel_size 行完整的特征输入，一次性拷贝进片上内存
+            // 1. 【搬运】一次性读入池化窗口覆盖的 11 行数据
             __memcpy(nram_in_h, in_map + iy_start * W, kernel_size * W * sizeof(half), GDRAM2NRAM);
 
-            // 2. 【升维】为了防止 121 个数字累加产生 FP16 的大数吃小数截断，全量转为 FP32
-            __bang_half2float(nram_in_f32, nram_in_h, kernel_size * W);
+            // 2. 【升维】转为 FP32 (1024 完美满足向量对齐)
+            __bang_half2float(nram_in_f, nram_in_h, kernel_size * W);
 
-            // 3. 【计算】逐个计算当前输出行的每一个像素点
-            for (int ox = 0; ox < W_out; ++ox) {
-                
-                int ix_start = ox * kernel_size;
-                float sum = 0.0f;
-
-                // 纯手工 11x11 窗口累加 (绝对精确)
-                for (int ky = 0; ky < kernel_size; ++ky) {
-                    for (int kx = 0; kx < kernel_size; ++kx) {
-                        sum += nram_in_f32[ky * W + ix_start + kx];
-                    }
-                }
-                
-                // 求均值并保存到输出缓存
-                nram_out_f32[ox] = sum * inv_k;
+            // 3. 🚀【核心提速：垂直向量化压缩】
+            // 先将第 0 行拷入 sum 缓存
+            __memcpy(nram_sum_f, nram_in_f, W * sizeof(float), NRAM2NRAM);
+            // 启动硬件级向量并发，把后续的 1 行到 10 行全部压扁进 sum_f 里
+            for (int ky = 1; ky < kernel_size; ++ky) {
+                __bang_add(nram_sum_f, nram_sum_f, nram_in_f + ky * W, W);
             }
 
-            // 4. 【降维与写回】采用 Round Nearest (就近舍入) 降回 FP16，并写回全局内存
-            __bang_float2half_rn(nram_out_h, nram_out_f32, W_out);
+            // 4. 【水平求和】现在只需要在一个 1D 数组上滑动
+            for (int ox = 0; ox < W_out; ++ox) {
+                float sum = 0.0f;
+                int ix_start = ox * kernel_size;
+                
+                // 标量加法次数由 121 锐减到 11
+                for (int kx = 0; kx < kernel_size; ++kx) {
+                    sum += nram_sum_f[ix_start + kx];
+                }
+                nram_out_f[ox] = sum * inv_k;
+            }
+
+            // 5. 【降维与写回】
+            // 使用对齐尺寸 128 满足硬件要求，确保极速转换
+            __bang_float2half_rn(nram_out_h, nram_out_f, ALIGN_SIZE);
+            
+            // 写回时只拷贝有效的 W_out (93) 个元素，截断尾部垃圾数据
             __memcpy(out_map + oy * W_out, nram_out_h, W_out * sizeof(half), NRAM2GDRAM);
         }
     }
@@ -73,7 +73,6 @@ __mlu_entry__ void avgpool_kernel(const half* input, half* output,
 // PyTorch C++ Wrapper 接口
 // ---------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
-    // 强制保证数据类型和物理内存连续性
     TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
     auto x_c = x.contiguous();
 
@@ -82,20 +81,15 @@ torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
     int H = x.size(2);
     int W = x.size(3);
 
-    // 默认步长等于卷积核大小，无 padding
     int stride = kernel_size; 
     
-    // 计算输出尺寸 (向下取整)
     int H_out = (H - kernel_size) / stride + 1;
     int W_out = (W - kernel_size) / stride + 1;
 
-    // 申请输出内存，继承原始输入的所有硬件和类型属性
     auto out = torch::empty({batch, channels, H_out, W_out}, x.options());
 
-    // 计算总的 2D 特征图数量
     int total_maps = batch * channels;
     
-    // 并发调度：如果特征图少于 16，按实际数量启动；否则启动 16 核
     uint32_t task_num = 16;
     if (total_maps < task_num) task_num = total_maps;
     
@@ -103,8 +97,7 @@ torch::Tensor bang_func(torch::Tensor x, int kernel_size) {
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动底层的核函数
-    avgpool_kernel<<<grid_dim, ktype, queue>>>(
+    avgpool_fast_kernel<<<grid_dim, ktype, queue>>>(
         reinterpret_cast<const half*>(x_c.data_ptr()),
         reinterpret_cast<half*>(out.data_ptr()),
         total_maps, H, W, H_out, W_out, kernel_size
