@@ -1,5 +1,6 @@
 #include <cmath>
 #include <stdint.h>
+#include <vector>
 #include <torch/extension.h>
 #include <torch/torch.h>
 
@@ -25,25 +26,32 @@ torch::Tensor bang_func(torch::Tensor x,
     int in_per_group = in_channels / groups;
     auto cpu_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
 
+    std::vector<int64_t> weight_shape;
+    weight_shape.push_back(out_channels);
+    weight_shape.push_back(in_per_group);
+    weight_shape.push_back(kernel_size);
+
     torch::manual_seed(42);
-    auto weight_cpu = torch::empty({out_channels, in_per_group, kernel_size}, cpu_opts);
+    auto weight_cpu = torch::empty(weight_shape, cpu_opts);
     double bound = 1.0 / std::sqrt(static_cast<double>(in_per_group * kernel_size));
     weight_cpu.uniform_(-bound, bound);
     auto weight = weight_cpu.to(x.options());
 
     c10::optional<torch::Tensor> bias_tensor = c10::nullopt;
-    if (bias) {
-        auto bias_cpu = torch::empty({out_channels}, cpu_opts);
+    if (bias != 0) {
+        std::vector<int64_t> bias_shape;
+        bias_shape.push_back(out_channels);
+        auto bias_cpu = torch::empty(bias_shape, cpu_opts);
         bias_cpu.uniform_(-bound, bound);
         bias_tensor = bias_cpu.to(x.options());
     }
 
-    return torch::conv1d(
-        x,
-        weight,
-        bias_tensor,
-        {stride},
-        {padding},
-        {dilation},
-        groups);
+    std::vector<int64_t> stride_v;
+    std::vector<int64_t> padding_v;
+    std::vector<int64_t> dilation_v;
+    stride_v.push_back(stride);
+    padding_v.push_back(padding);
+    dilation_v.push_back(dilation);
+
+    return torch::conv1d(x, weight, bias_tensor, stride_v, padding_v, dilation_v, groups);
 }
