@@ -2,37 +2,43 @@
 #include <cnrt.h>
 #include <torch/extension.h>
 
-// 纯 FP32 安全分块 (完美整除 m=512, k=1024, n=2048)
-// 内存占用：64*16(4KB) + 16*512(32KB) + 64*512(128KB) = 164KB，极其安全
+// ---------------------------------------------------------
+// 1. 定义基础分块大小 (Tile Size)
+// 64x64 是极其保守和安全的尺寸，完美整除矩阵维度
+// ---------------------------------------------------------
 #define BM 64
-#define BK 16
-#define BN 512
+#define BK 64
+#define BN 64
 
 // ---------------------------------------------------------
-// BANG C 核函数：100% 纯 FP32 向量化矩阵乘法 (0精度损失)
+// 2. BANG C 核函数：最基础的分块矩阵乘法 (基于向量外积)
 // ---------------------------------------------------------
-__mlu_entry__ void bmm_kernel(const float* A, const float* B, float* C,
-                              int batch, int m, int k, int n) {
-    // 全程 FP32 缓冲，彻底杜绝类型转换导致的截断误差
+__mlu_entry__ void basic_bmm_kernel(const float* A, const float* B, float* C,
+                                    int batch, int m, int k, int n) {
+    // 在 NRAM (片上内存) 开辟三个缓冲块，存放切下来的 A块、B块、C块
     __nram__ float nram_A[BM * BK];
     __nram__ float nram_B[BK * BN];
     __nram__ float nram_C[BM * BN];
-    __nram__ float nram_temp[BN];
+    __nram__ float nram_temp[BN]; // 向量计算时的临时存放点
 
+    // TaskId 决定当前核处理哪个 Batch
     for (int b = taskId; b < batch; b += taskDim) {
+        // 定位到当前 Batch 在全局内存中的起始位置
         const float* A_b = A + b * m * k;
         const float* B_b = B + b * k * n;
         float* C_b = C + b * m * n;
 
+        // 遍历 C 矩阵的每一个 64x64 的块
         for (int i = 0; i < m; i += BM) {
             for (int j = 0; j < n; j += BN) {
                 
-                // C 块输出清零 (FP32)
+                // 将当前 C 块在片上清零，准备开始累加
                 __bang_write_value(nram_C, BM * BN, 0.0f);
 
+                // 沿着 K 维度，一步步滑动切块
                 for (int l = 0; l < k; l += BK) {
                     
-                    // 1. 载入 FP32 的 A 块和 B 块 (直接读，不转换)
+                    // 【读】从 GDRAM 逐行拷贝 A 块和 B 块到 NRAM
                     for (int r = 0; r < BM; ++r) {
                         __memcpy(nram_A + r * BK, A_b + (i + r) * k + l, BK * sizeof(float), GDRAM2NRAM);
                     }
@@ -40,25 +46,23 @@ __mlu_entry__ void bmm_kernel(const float* A, const float* B, float* C,
                         __memcpy(nram_B + r * BN, B_b + (l + r) * n + j, BN * sizeof(float), GDRAM2NRAM);
                     }
 
-                    // 2. 纯 FP32 向量外积计算
+                    // 【算】使用基础向量指令进行矩阵乘法 (A块 * B块)
                     for (int kk = 0; kk < BK; ++kk) {
-                        float* B_row = nram_B + kk * BN;
+                        float* B_row = nram_B + kk * BN; // 取 B 块的一行向量
                         
                         for (int ii = 0; ii < BM; ++ii) {
-                            float a_val = nram_A[ii * BK + kk];
+                            float a_val = nram_A[ii * BK + kk]; // 取 A 块的一个标量
                             
-                            // 遇 0 跳过，榨取额外的向量吞吐性能
-                            if (a_val != 0.0f) {
-                                // FP32 向量乘标量
-                                __bang_mul_scalar(nram_temp, B_row, a_val, BN);
-                                // FP32 向量累加
-                                __bang_add(nram_C + ii * BN, nram_C + ii * BN, nram_temp, BN);
-                            }
+                            // 向量乘法：temp_vector = B_row * a_val
+                            __bang_mul_scalar(nram_temp, B_row, a_val, BN);
+                            
+                            // 向量加法：C_row = C_row + temp_vector
+                            __bang_add(nram_C + ii * BN, nram_C + ii * BN, nram_temp, BN);
                         }
                     }
                 }
 
-                // 3. 将绝对精确的结果写回
+                // 【写】当前 64x64 的 C 块已经彻底累加完毕，写回 GDRAM
                 for (int r = 0; r < BM; ++r) {
                     __memcpy(C_b + (i + r) * n + j, nram_C + r * BN, BN * sizeof(float), NRAM2GDRAM);
                 }
@@ -68,26 +72,28 @@ __mlu_entry__ void bmm_kernel(const float* A, const float* B, float* C,
 }
 
 // ---------------------------------------------------------
-// PyTorch C++ Wrapper：保留原生精度
+// 3. PyTorch C++ Wrapper：安全无副作用的前端接口
 // ---------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 🌟 核心修复：直接以 FP32 格式送入 MLU，保留全部尾数精度！
+    // 强制数据在物理内存上连续，并统一转化为 FP32
     auto A_f = A.toType(torch::kFloat32).contiguous();
     auto B_f = B.toType(torch::kFloat32).contiguous();
     
-    // 输出自然也是 FP32
+    // 初始化输出 Tensor，类型与 A 保持一致
     auto C = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options().dtype(torch::kFloat32));
 
     int batch = A.size(0);
-    uint32_t task_num = 16;
+    uint32_t task_num = 16; // 默认使用 16 核并发
     if (batch < task_num) task_num = batch;
     
     cnrtDim3_t grid_dim = {task_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
     
+    // 获取当前流
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    bmm_kernel<<<grid_dim, ktype, queue>>>(
+    // 启动核函数
+    basic_bmm_kernel<<<grid_dim, ktype, queue>>>(
         reinterpret_cast<const float*>(A_f.data_ptr()),
         reinterpret_cast<const float*>(B_f.data_ptr()),
         reinterpret_cast<float*>(C.data_ptr()),
