@@ -32,7 +32,7 @@ torch::Tensor bang_func(torch::Tensor x,
     weight_shape.push_back(kernel_size);
     weight_shape.push_back(kernel_size);
 
-    torch::manual_seed(42);
+    torch::manual_seed(1012);
     auto weight_cpu = torch::empty(weight_shape, cpu_opts);
     double bound = 1.0 / std::sqrt(static_cast<double>(out_per_group * kernel_size * kernel_size));
     weight_cpu.uniform_(-bound, bound);
