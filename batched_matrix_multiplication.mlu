@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
-// 完美张量分块尺寸 (128x64x128)，完美压进 512KB NRAM 容量
+// 完美张量分块尺寸 (128x64x128)，完美压进 NRAM 容量
 #define BM 128
 #define BK 64
 #define BN 128
@@ -17,10 +17,13 @@ __mlu_entry__ void bmm_kernel(const half* A, const half* B, float* C,
     __nram__ half nram_A[BM * BK];
     __nram__ half nram_B[BK * BN];
     
-    // 🌟 核心轨道：B 矩阵必须挂载在 WRAM（权重内存）才能激活张量核心
+    // 🌟 核心轨道：B 矩阵挂载 WRAM，激活张量核心
     __wram__ half wram_B[BK * BN];
     
-    // 🌟 核心精度：Tensor Core 硬件直出 FP32 乘积
+    // 🌟 顺应硬件：Tensor Core 强制要求输出为 half
+    __nram__ half nram_C_half[BM * BN];
+    
+    // FP32 转换与高精度长程累加器
     __nram__ float nram_C_temp[BM * BN];
     __nram__ float nram_C_acc[BM * BN]; 
 
@@ -49,15 +52,17 @@ __mlu_entry__ void bmm_kernel(const half* A, const half* B, float* C,
                     __memcpy(wram_B, nram_B, BK * BN * sizeof(half), NRAM2WRAM);
 
                     // 3. 🚀 唤醒张量核心！
-                    // 致命修复：传入第 7 个参数 `0` (浮点运算忽略定点位移)
-                    // 硬件自动完成 FP16 * FP16 并输出高精度 FP32 到 C_temp
-                    __bang_matmul(nram_C_temp, nram_A, wram_B, BM, BK, BN, 0);
+                    // 传入 half 输出数组，加上第 7 个参数 `0` 完美匹配 API 签名
+                    __bang_matmul(nram_C_half, nram_A, wram_B, BM, BK, BN, 0);
 
-                    // 4. 将高精度结果累加
+                    // 4. 精度防线：立刻将张量核心的短程结果转为 FP32
+                    __bang_half2float(nram_C_temp, nram_C_half, BM * BN);
+                    
+                    // 5. 累加进高精度累加器，避免 K=1024 带来的误差塌陷
                     __bang_add(nram_C_acc, nram_C_acc, nram_C_temp, BM * BN);
                 }
 
-                // 5. 写入最终结果
+                // 6. 写入最终结果
                 for (int r = 0; r < BM; ++r) {
                     __memcpy(C_b + (i + r) * n + j, nram_C_acc + r * BN, BN * sizeof(float), NRAM2GDRAM);
                 }
@@ -67,14 +72,14 @@ __mlu_entry__ void bmm_kernel(const half* A, const half* B, float* C,
 }
 
 // ---------------------------------------------------------
-// PyTorch C++ Wrapper：自动继承设备类型
+// PyTorch C++ Wrapper
 // ---------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 自动继承当前 Tensor 所在的 MLU 设备，转换为硬件所需的半精度
+    // 转为 FP16 喂给硬件张量核心
     auto A_h = A.toType(torch::kHalf).contiguous();
     auto B_h = B.toType(torch::kHalf).contiguous();
     
-    // 输出采用 FP32 保证极高精度，并继承 A 的设备信息
+    // 保持输出为 FP32，完美匹配原始接口
     auto C = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options().dtype(torch::kFloat32));
 
     int batch = A.size(0);
@@ -82,7 +87,6 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int k = A.size(2);
     int n = B.size(2);
 
-    // 标准 16 核并发
     uint32_t task_num = 16;
     if (batch < task_num) task_num = batch;
     
