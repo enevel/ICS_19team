@@ -1,99 +1,153 @@
-#include <bang.h>
-#include <cnrt.h>
-#include <stdint.h>
 #include <torch/extension.h>
+#include <cnrt.h>
+#include <bang.h>
+#include <cstring>
 
-// 黄金立方分块：完美榨干 NRAM，大幅降低 GDRAM 读写次数
-#define BM 128
-#define BK 128
-#define BN 128
+// Tile sizes (multiple of 64 for efficient vectorization)
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 32
 
-// ---------------------------------------------------------
-// BANG C 核函数：INT16 硬件张量引擎 (完全迎合 Compute 30 架构)
-// ---------------------------------------------------------
-__mlu_entry__ void bmm_kernel(const int16_t* A, const int16_t* B, float* C,
-                              int batch, int m, int k, int n) {
-    // 强制转换为底层硬件唯二接受的 int16_t 类型缓冲
-    __nram__ int16_t nram_A[BM * BK];
-    __nram__ int16_t nram_B[BK * BN];
-    __wram__ int16_t wram_B[BK * BN];
-    
-    // 张量核心硬件直出 FP32 (实际内部为 int32 转换而来)
-    __nram__ float nram_C_temp[BM * BN];
-    __nram__ float nram_C_acc[BM * BN]; 
-
-    for (int b = taskId; b < batch; b += taskDim) {
-        const int16_t* A_b = A + b * m * k;
-        const int16_t* B_b = B + b * k * n;
-        float* C_b = C + b * m * n;
-
-        for (int i = 0; i < m; i += BM) {
-            for (int j = 0; j < n; j += BN) {
-                
-                // 将 FP32 累加器清零
-                __bang_write_value(nram_C_acc, BM * BN, 0.0f);
-
-                for (int l = 0; l < k; l += BK) {
-                    
-                    // 1. 载入 INT16 量化块
-                    for (int r = 0; r < BM; ++r) {
-                        __memcpy(nram_A + r * BK, A_b + (i + r) * k + l, BK * sizeof(int16_t), GDRAM2NRAM);
-                    }
-                    for (int r = 0; r < BK; ++r) {
-                        __memcpy(nram_B + r * BN, B_b + (l + r) * n + j, BN * sizeof(int16_t), GDRAM2NRAM);
-                    }
-                    __memcpy(wram_B, nram_B, BK * BN * sizeof(int16_t), NRAM2WRAM);
-
-                    // 2. 🚀 唤醒张量核心！
-                    // 7参数签名：完美匹配 `float* dst, int16_t* src1, int16_t* src2...`
-                    __bang_matmul(nram_C_temp, nram_A, wram_B, BM, BK, BN, 0);
-
-                    // 3. 核心精度防线：反量化 (Dequantization)
-                    // 缩放因子为 4000，反推倒数为 1.0f / (4000.0f * 4000.0f) = 6.25e-8f
-                    __bang_mul_scalar(nram_C_temp, nram_C_temp, 6.25e-08f, BM * BN);
-
-                    // 4. 高精度 FP32 累加
-                    __bang_add(nram_C_acc, nram_C_acc, nram_C_temp, BM * BN);
-                }
-
-                // 5. 写入完美结果
-                for (int r = 0; r < BM; ++r) {
-                    __memcpy(C_b + (i + r) * n + j, nram_C_acc + r * BN, BN * sizeof(float), NRAM2GDRAM);
-                }
-            }
-        }
+// ----------------------------------------------------------------------
+// Helper: load a 2D tile from GDRAM to NRAM with zero-padding
+// ----------------------------------------------------------------------
+__mlu_func__ void load_tile_2d_pad(
+    float *dst,
+    const float *src,
+    int rows, int cols,
+    int ld,
+    int tile_h, int tile_w,
+    int start_row, int start_col
+) {
+    __bang_write_value(dst, tile_h * tile_w, 0.0f);
+    int load_rows = (start_row + tile_h > rows) ? rows - start_row : tile_h;
+    int load_cols = (start_col + tile_w > cols) ? cols - start_col : tile_w;
+    if (load_rows <= 0 || load_cols <= 0) return;
+    for (int i = 0; i < load_rows; i++) {
+        const float *src_row = src + (start_row + i) * ld + start_col;
+        float *dst_row = dst + i * tile_w;
+        __memcpy(dst_row, src_row, load_cols * sizeof(float), GDRAM2NRAM);
     }
 }
 
-// ---------------------------------------------------------
-// PyTorch C++ Wrapper：工业级动态量化前处理
-// ---------------------------------------------------------
+// ----------------------------------------------------------------------
+// Main kernel: batched tiled matrix multiplication
+// ----------------------------------------------------------------------
+__mlu_global__ void batched_matmul_kernel(
+    const float *A,
+    const float *B,
+    float *C,
+    int batch_size,
+    int m,
+    int k,
+    int n
+) {
+    int b  = __mlu_get_task_id_x();
+    int ty = __mlu_get_task_id_y();
+    int tz = __mlu_get_task_id_z();
+    if (b >= batch_size) return;
+
+    const float *A_base = A + b * (m * k);
+    const float *B_base = B + b * (k * n);
+    float *C_base = C + b * (m * n);
+
+    int start_m = ty * TILE_M;
+    int start_n = tz * TILE_N;
+    if (start_m >= m || start_n >= n) return;
+
+    int cur_tile_m = (start_m + TILE_M > m) ? m - start_m : TILE_M;
+    int cur_tile_n = (start_n + TILE_N > n) ? n - start_n : TILE_N;
+
+    // Declare all NRAM buffers at the beginning
+    __nram__ float A_tile[TILE_M * TILE_K];
+    __nram__ float B_tile[TILE_K * TILE_N];
+    __nram__ float C_tile[TILE_M * TILE_N];
+    __nram__ float tmp[TILE_N];   // temporary vector for scalar-vector multiply
+
+    __bang_write_value(C_tile, TILE_M * TILE_N, 0.0f);
+
+    // Loop over the K dimension
+    for (int kk = 0; kk < k; kk += TILE_K) {
+        int cur_tile_k = (kk + TILE_K > k) ? k - kk : TILE_K;
+
+        // Load A and B tiles
+        load_tile_2d_pad(A_tile, A_base, m, k, k, TILE_M, TILE_K, start_m, kk);
+        load_tile_2d_pad(B_tile, B_base, k, n, n, TILE_K, TILE_N, kk, start_n);
+
+        // Compute: each row of C_tile += A_ik * B_row for all k in tile
+        for (int i = 0; i < cur_tile_m; i++) {
+            float *A_row = A_tile + i * TILE_K;
+            float *C_row = C_tile + i * TILE_N;
+
+            for (int kb = 0; kb < cur_tile_k; kb++) {
+                float aik = A_row[kb];
+                const float *B_row = B_tile + kb * TILE_N;
+                // tmp = aik * B_row
+                __bang_mul_scalar(tmp, B_row, aik, cur_tile_n);
+                // C_row += tmp
+                __bang_add(C_row, C_row, tmp, cur_tile_n);
+            }
+        }
+    }
+
+    // Store C_tile back to global memory (only the valid part)
+    for (int i = 0; i < cur_tile_m; i++) {
+        float *dst_row = C_base + (start_m + i) * n + start_n;
+        float *src_row = C_tile + i * TILE_N;
+        __memcpy(dst_row, src_row, cur_tile_n * sizeof(float), NRAM2GDRAM);
+    }
+}
+
+// ----------------------------------------------------------------------
+// C++ wrapper: bang_func
+// ----------------------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 🌟 解决 44.5 误差的核心：严格使用 .round() 避免单向截断误差，并将放大倍数提升至 4000.0f
-    auto A_i16 = A.mul(4000.0f).round().toType(torch::kInt16).contiguous();
-    auto B_i16 = B.mul(4000.0f).round().toType(torch::kInt16).contiguous();
-    
-    // 输出保持为 FP32
-    auto C = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options().dtype(torch::kFloat32));
+    // 输入校验
+    TORCH_CHECK(A.dim() == 3, "A must be 3D");
+    TORCH_CHECK(B.dim() == 3, "B must be 3D");
+    TORCH_CHECK(A.size(0) == B.size(0), "Batch dim mismatch");
+    TORCH_CHECK(A.size(2) == B.size(1), "Inner dim mismatch");
 
-    int batch = A.size(0);
-    int m = A.size(1);
-    int k = A.size(2);
-    int n = B.size(2);
+    auto batch_size = A.size(0);
+    auto m = A.size(1);
+    auto k = A.size(2);
+    auto n = B.size(2);
 
-    uint32_t task_num = 16;
-    if (batch < task_num) task_num = batch;
-    
-    cnrtDim3_t grid_dim = {task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
-    
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    // 确保数据类型为 float32，且内存连续
+    auto A_contig = A.contiguous().to(torch::kFloat32);
+    auto B_contig = B.contiguous().to(torch::kFloat32);
 
-    bmm_kernel<<<grid_dim, ktype, queue>>>(
-        reinterpret_cast<const int16_t*>(A_i16.data_ptr()),
-        reinterpret_cast<const int16_t*>(B_i16.data_ptr()),
-        reinterpret_cast<float*>(C.data_ptr()),
-        batch, m, k, n);
+    auto C = torch::empty({batch_size, m, n}, A_contig.options());
+
+    // 计算网格维度
+    int grid_m = (m + TILE_M - 1) / TILE_M;
+    int grid_n = (n + TILE_N - 1) / TILE_N;
+    dim3 grid(batch_size, grid_m, grid_n);
+    dim3 block(1);  // 每个 task 为单线程，向量化执行
+
+    // 获取当前 MLU 流
+    auto stream = at::mlu::getCurrentMLUStream();
+    cnrtInvokeKernel(
+        (void *)&batched_matmul_kernel,
+        grid,
+        block,
+        /*args*/ (void *[]){
+            const_cast<float*>(A_contig.data_ptr<float>()),
+            const_cast<float*>(B_contig.data_ptr<float>()),
+            C.data_ptr<float>(),
+            const_cast<int*>(&batch_size),
+            const_cast<int*>(&m),
+            const_cast<int*>(&k),
+            const_cast<int*>(&n)
+        },
+        0,
+        stream
+    );
 
     return C;
+}
+
+// 必须的 PyTorch 扩展绑定
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("bang_func", &bang_func, "batched matrix multiplication (MLU)");
 }
