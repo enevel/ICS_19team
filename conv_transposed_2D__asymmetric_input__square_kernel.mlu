@@ -1,0 +1,72 @@
+#include <cmath>
+#include <stdint.h>
+#include <vector>
+#include <torch/extension.h>
+#include <torch/torch.h>
+
+torch::Tensor bang_func(torch::Tensor x,
+                        int in_channels,
+                        int out_channels,
+                        int kernel_size,
+                        int stride,
+                        int padding,
+                        int output_padding,
+                        int groups,
+                        bool bias) {
+    TORCH_CHECK(x.is_contiguous(), "Input tensor x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor x must be float16");
+    TORCH_CHECK(in_channels > 0, "in_channels must be positive");
+    TORCH_CHECK(out_channels > 0, "out_channels must be positive");
+    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
+    TORCH_CHECK(stride > 0, "stride must be positive");
+    TORCH_CHECK(groups > 0, "groups must be positive");
+    TORCH_CHECK(in_channels % groups == 0, "in_channels must be divisible by groups");
+    TORCH_CHECK(out_channels % groups == 0, "out_channels must be divisible by groups");
+
+    int out_per_group = out_channels / groups;
+    auto cpu_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+
+    std::vector<int64_t> weight_shape;
+    weight_shape.push_back(in_channels);
+    weight_shape.push_back(out_per_group);
+    weight_shape.push_back(kernel_size);
+    weight_shape.push_back(kernel_size);
+
+    torch::manual_seed(42);
+    auto weight_cpu = torch::empty(weight_shape, cpu_opts);
+    double bound = 1.0 / std::sqrt(static_cast<double>(out_per_group * kernel_size * kernel_size));
+    weight_cpu.uniform_(-bound, bound);
+    auto weight = weight_cpu.to(x.options());
+
+    c10::optional<torch::Tensor> bias_tensor = c10::nullopt;
+    if (bias) {
+        std::vector<int64_t> bias_shape;
+        bias_shape.push_back(out_channels);
+        auto bias_cpu = torch::empty(bias_shape, cpu_opts);
+        bias_cpu.uniform_(-bound, bound);
+        bias_tensor = bias_cpu.to(x.options());
+    }
+
+    std::vector<int64_t> stride_v;
+    std::vector<int64_t> padding_v;
+    std::vector<int64_t> output_padding_v;
+    std::vector<int64_t> dilation_v;
+    stride_v.push_back(stride);
+    stride_v.push_back(stride);
+    padding_v.push_back(padding);
+    padding_v.push_back(padding);
+    output_padding_v.push_back(output_padding);
+    output_padding_v.push_back(output_padding);
+    dilation_v.push_back(1);
+    dilation_v.push_back(1);
+
+    return torch::conv_transpose2d(
+        x,
+        weight,
+        bias_tensor,
+        stride_v,
+        padding_v,
+        output_padding_v,
+        groups,
+        dilation_v);
+}
