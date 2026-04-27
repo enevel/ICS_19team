@@ -3,70 +3,63 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
-// 黄金分块尺寸：完美整除官方的 m=512, k=1024, n=2048
-#define BM 32
-#define BK 32
-#define BN 512
+// 完美张量分块尺寸 (128x64x128)，完美压进 512KB NRAM 容量
+#define BM 128
+#define BK 64
+#define BN 128
 
 // ---------------------------------------------------------
-// BANG C 核函数：基于纯向量外积的安全 BMM (绕开所有 API 黑盒)
+// BANG C 核函数：激活硬件 Tensor Core 的混合精度矩阵乘法
 // ---------------------------------------------------------
 __mlu_entry__ void bmm_kernel(const half* A, const half* B, float* C,
                               int batch, int m, int k, int n) {
-    // 所有的计算全在 NRAM 中完成，总占用约 100KB，绝对安全
+    // A/B 矩阵的输入缓冲 (FP16)
     __nram__ half nram_A[BM * BK];
     __nram__ half nram_B[BK * BN];
-    __nram__ float nram_C[BM * BN];
+    
+    // 🌟 核心轨道：B 矩阵必须挂载在 WRAM（权重内存）才能激活张量核心
+    __wram__ half wram_B[BK * BN];
+    
+    // 🌟 核心精度：Tensor Core 硬件直出 FP32 乘积
+    __nram__ float nram_C_temp[BM * BN];
+    __nram__ float nram_C_acc[BM * BN]; 
 
-    // 向量外积辅助寄存器
-    __nram__ float nram_B_row_f32[BN];
-    __nram__ float nram_A_val_f32[BN];
-
-    // 按 Batch 进行多核并行
     for (int b = taskId; b < batch; b += taskDim) {
         const half* A_b = A + b * m * k;
         const half* B_b = B + b * k * n;
         float* C_b = C + b * m * n;
 
-        // 遍历 C 矩阵的输出块
         for (int i = 0; i < m; i += BM) {
             for (int j = 0; j < n; j += BN) {
                 
-                // 初始化 C 输出块为 0 (FP32高精度)
-                __bang_write_value(nram_C, BM * BN, 0.0f);
+                // 将 FP32 累加器清零
+                __bang_write_value(nram_C_acc, BM * BN, 0.0f);
 
-                // K 维度累加
                 for (int l = 0; l < k; l += BK) {
                     
-                    // 1. 将 A 块和 B 块搬运至 NRAM
+                    // 1. 载入 A 块
                     for (int r = 0; r < BM; ++r) {
                         __memcpy(nram_A + r * BK, A_b + (i + r) * k + l, BK * sizeof(half), GDRAM2NRAM);
                     }
+                    
+                    // 2. 载入 B 块并送入 WRAM 专线
                     for (int r = 0; r < BK; ++r) {
                         __memcpy(nram_B + r * BN, B_b + (l + r) * n + j, BN * sizeof(half), GDRAM2NRAM);
                     }
+                    __memcpy(wram_B, nram_B, BK * BN * sizeof(half), NRAM2WRAM);
 
-                    // 2. 🚀 向量外积乘法：绝不调用会报错的 matmul API
-                    for (int kk = 0; kk < BK; ++kk) {
-                        // 提取 B 的一整行，并立刻升维至 FP32
-                        __bang_half2float(nram_B_row_f32, nram_B + kk * BN, BN);
+                    // 3. 🚀 唤醒张量核心！
+                    // 致命修复：传入第 7 个参数 `0` (浮点运算忽略定点位移)
+                    // 硬件自动完成 FP16 * FP16 并输出高精度 FP32 到 C_temp
+                    __bang_matmul(nram_C_temp, nram_A, wram_B, BM, BK, BN, 0);
 
-                        for (int ii = 0; ii < BM; ++ii) {
-                            // 从 A 中取出一个标量
-                            float a_val_f = (float)(nram_A[ii * BK + kk]);
-                            
-                            // A 的标量 * B 的一行 = C 的对应行增量
-                            __bang_mul_scalar(nram_A_val_f32, nram_B_row_f32, a_val_f, BN);
-                            
-                            // 累加进 C 块
-                            __bang_add(nram_C + ii * BN, nram_C + ii * BN, nram_A_val_f32, BN);
-                        }
-                    }
+                    // 4. 将高精度结果累加
+                    __bang_add(nram_C_acc, nram_C_acc, nram_C_temp, BM * BN);
                 }
 
-                // 3. 累加完毕，将高精度 FP32 的块写回全局内存
+                // 5. 写入最终结果
                 for (int r = 0; r < BM; ++r) {
-                    __memcpy(C_b + (i + r) * n + j, nram_C + r * BN, BN * sizeof(float), NRAM2GDRAM);
+                    __memcpy(C_b + (i + r) * n + j, nram_C_acc + r * BN, BN * sizeof(float), NRAM2GDRAM);
                 }
             }
         }
@@ -74,14 +67,14 @@ __mlu_entry__ void bmm_kernel(const half* A, const half* B, float* C,
 }
 
 // ---------------------------------------------------------
-// PyTorch C++ Wrapper：动态继承设备，拒绝硬编码报错
+// PyTorch C++ Wrapper：自动继承设备类型
 // ---------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 强制数据连续并转为 FP16，但不指定 specific device，依靠 PyTorch 原有设备流转
-    auto A_h = A.to(torch::kHalf).contiguous();
-    auto B_h = B.to(torch::kHalf).contiguous();
+    // 自动继承当前 Tensor 所在的 MLU 设备，转换为硬件所需的半精度
+    auto A_h = A.toType(torch::kHalf).contiguous();
+    auto B_h = B.toType(torch::kHalf).contiguous();
     
-    // 🌟 修复关键：使用 A.options() 继承原张量的 device (MLU)，不再触发 kMLU 报错
+    // 输出采用 FP32 保证极高精度，并继承 A 的设备信息
     auto C = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options().dtype(torch::kFloat32));
 
     int batch = A.size(0);
@@ -89,7 +82,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int k = A.size(2);
     int n = B.size(2);
 
-    // 标准调度：16个核心
+    // 标准 16 核并发
     uint32_t task_num = 16;
     if (batch < task_num) task_num = batch;
     
