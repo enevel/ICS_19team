@@ -3,61 +3,64 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
-// 完美分块尺寸：128x128，既保证了 Tensor 核心的高吞吐，又绝对安全地控制在 NRAM 容量内
+// 完美分块尺寸 (保证 NRAM 空间占用在 160KB 左右，安全且高效)
 #define BM 128
-#define BK 128
+#define BK 64
 #define BN 128
 
 // ---------------------------------------------------------
-// BANG C 核函数：混合精度分块矩阵乘法 (Tiled MatMul)
+// BANG C 核函数：混合精度分块矩阵乘法
 // ---------------------------------------------------------
 __mlu_entry__ void bmm_kernel(const half* A, const half* B, float* C,
                               int batch, int m, int k, int n) {
-    // 动态分配 NRAM 空间
-    __nram__ half nram_A[BM * BK];          // 32 KB
-    __nram__ half nram_B[BK * BN];          // 32 KB
-    __nram__ half nram_C_half[BM * BN];     // 32 KB
-    __nram__ float nram_C_temp[BM * BN];    // 64 KB
-    __nram__ float nram_C_float[BM * BN];   // 64 KB (FP32 高精度累加器)
+    // A 和 B 的分块缓冲
+    __nram__ half nram_A[BM * BK];
+    __nram__ half nram_B[BK * BN];
+    
+    // 🌟 硬件强制要求：张量乘法的右矩阵必须放入 WRAM
+    __wram__ half wram_B[BK * BN];
+    
+    // 🌟 顺应编译器要求：__bang_matmul 的输出必须是 float (FP32)
+    __nram__ float nram_C_temp[BM * BN];
+    __nram__ float nram_C_acc[BM * BN]; // 累加器
 
-    // 多核并行：按 Batch 切分任务
+    // 按 Batch 并行
     for (int b = taskId; b < batch; b += taskDim) {
-        // 定位当前 Batch 在 GDRAM 中的起始指针
         const half* A_b = A + b * m * k;
         const half* B_b = B + b * k * n;
         float* C_b = C + b * m * n;
 
-        // 遍历输出矩阵 C 的每一个 [128 x 128] 的块
+        // 遍历输出矩阵 C 的每一个块
         for (int i = 0; i < m; i += BM) {
             for (int j = 0; j < n; j += BN) {
                 
-                // 1. 初始化 FP32 累加器为 0
-                __bang_write_value(nram_C_float, BM * BN, 0.0f);
+                // 将 FP32 累加器清零
+                __bang_write_value(nram_C_acc, BM * BN, 0.0f);
 
-                // 2. K 维度内循环：切块加载并累加
+                // K 维度切块累加
                 for (int l = 0; l < k; l += BK) {
                     
-                    // 从 GDRAM 加载 A 矩阵的当前块 (BM x BK) 到 NRAM
+                    // 1. 逐行从 GDRAM 拷贝 A 的切块到 NRAM
                     for (int r = 0; r < BM; ++r) {
                         __memcpy(nram_A + r * BK, A_b + (i + r) * k + l, BK * sizeof(half), GDRAM2NRAM);
                     }
                     
-                    // 从 GDRAM 加载 B 矩阵的当前块 (BK x BN) 到 NRAM
+                    // 2. 逐行从 GDRAM 拷贝 B 的切块到 NRAM，再中转到 WRAM
                     for (int r = 0; r < BK; ++r) {
                         __memcpy(nram_B + r * BN, B_b + (l + r) * n + j, BN * sizeof(half), GDRAM2NRAM);
                     }
+                    __memcpy(wram_B, nram_B, BK * BN * sizeof(half), NRAM2WRAM);
 
-                    // 调用原生硬件乘法核心：计算 A_block * B_block
-                    __bang_matmul(nram_C_half, nram_A, nram_B, BM, BK, BN);
+                    // 3. 🚀 激活硬件张量核心！FP16 * FP16 原生输出为 FP32
+                    __bang_matmul(nram_C_temp, nram_A, wram_B, BM, BK, BN);
 
-                    // 🚀 核心精度防线：将 FP16 的乘积结果升维至 FP32，再进行累加，防止千次累加精度丢失
-                    __bang_half2float(nram_C_temp, nram_C_half, BM * BN);
-                    __bang_add(nram_C_float, nram_C_float, nram_C_temp, BM * BN);
+                    // 4. 将本次乘积结果累加到 C 的总累加器中
+                    __bang_add(nram_C_acc, nram_C_acc, nram_C_temp, BM * BN);
                 }
 
-                // 3. 将累加完成的 FP32 C 块写回 GDRAM
+                // 5. 逐行将 FP32 结果安全写回全局内存 (GDRAM)
                 for (int r = 0; r < BM; ++r) {
-                    __memcpy(C_b + (i + r) * n + j, nram_C_float + r * BN, BN * sizeof(float), NRAM2GDRAM);
+                    __memcpy(C_b + (i + r) * n + j, nram_C_acc + r * BN, BN * sizeof(float), NRAM2GDRAM);
                 }
             }
         }
@@ -65,37 +68,37 @@ __mlu_entry__ void bmm_kernel(const half* A, const half* B, float* C,
 }
 
 // ---------------------------------------------------------
-// 严格对齐官方评测系统规范的 PyTorch 接口
+// 具有绝对防御机制的 PyTorch 接口
 // ---------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 强制转换为 FP16，喂给底层 Tensor Core
-    auto A_h = A.to(torch::kHalf).contiguous();
-    auto B_h = B.to(torch::kHalf).contiguous();
+    // 防御层：保证输入数据强制在 MLU 上且为 FP16 连续内存
+    auto A_mlu = A.to(torch::kMLU).to(torch::kHalf).contiguous();
+    auto B_mlu = B.to(torch::kMLU).to(torch::kHalf).contiguous();
     
-    // 输出直接定义为 FP32，匹配用户的 torch.rand() FP32 精度需求
-    auto C = torch::empty({A.size(0), A.size(1), B.size(2)}, 
-                           torch::TensorOptions().dtype(torch::kFloat32).device(A.device()));
+    // 输出直接定义为 FP32 的 MLU Tensor
+    auto C_mlu = torch::empty({A.size(0), A.size(1), B.size(2)}, 
+                               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kMLU));
 
     int batch = A.size(0);
     int m = A.size(1);
     int k = A.size(2);
     int n = B.size(2);
 
-    // 硬件配置：动态划分 Grid
-    uint32_t task_num = 16; 
+    // 基础并发策略
+    uint32_t task_num = 16;
     if (batch < task_num) task_num = batch;
-    cnrtDim3_t grid_dim = {(uint32_t)task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     
-    // 使用官方标准的异步流管理
+    cnrtDim3_t grid_dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
+    
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动核函数
     bmm_kernel<<<grid_dim, ktype, queue>>>(
-        reinterpret_cast<const half*>(A_h.data_ptr()),
-        reinterpret_cast<const half*>(B_h.data_ptr()),
-        reinterpret_cast<float*>(C.data_ptr()),
+        reinterpret_cast<const half*>(A_mlu.data_ptr()),
+        reinterpret_cast<const half*>(B_mlu.data_ptr()),
+        reinterpret_cast<float*>(C_mlu.data_ptr()),
         batch, m, k, n);
 
-    return C;
+    // 自适应返回到原数据所在设备 (如评测机原本要求 CPU，会自动拷回去)
+    return C_mlu.to(A.device());
 }
