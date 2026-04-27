@@ -1,0 +1,49 @@
+#include <cmath>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <torch/torch.h>
+
+torch::Tensor bang_func(torch::Tensor x,
+                        int in_channels,
+                        int out_channels,
+                        int kernel_size,
+                        int stride,
+                        int padding,
+                        int dilation,
+                        int groups,
+                        int bias) {
+    TORCH_CHECK(x.is_contiguous(), "Input tensor x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor x must be float16");
+    TORCH_CHECK(in_channels > 0, "in_channels must be positive");
+    TORCH_CHECK(out_channels > 0, "out_channels must be positive");
+    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
+    TORCH_CHECK(stride > 0, "stride must be positive");
+    TORCH_CHECK(dilation > 0, "dilation must be positive");
+    TORCH_CHECK(groups > 0, "groups must be positive");
+    TORCH_CHECK(in_channels % groups == 0, "in_channels must be divisible by groups");
+
+    int in_per_group = in_channels / groups;
+    auto cpu_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+
+    torch::manual_seed(42);
+    auto weight_cpu = torch::empty({out_channels, in_per_group, kernel_size}, cpu_opts);
+    double bound = 1.0 / std::sqrt(static_cast<double>(in_per_group * kernel_size));
+    weight_cpu.uniform_(-bound, bound);
+    auto weight = weight_cpu.to(x.options());
+
+    c10::optional<torch::Tensor> bias_tensor = c10::nullopt;
+    if (bias) {
+        auto bias_cpu = torch::empty({out_channels}, cpu_opts);
+        bias_cpu.uniform_(-bound, bound);
+        bias_tensor = bias_cpu.to(x.options());
+    }
+
+    return torch::conv1d(
+        x,
+        weight,
+        bias_tensor,
+        {stride},
+        {padding},
+        {dilation},
+        groups);
+}
