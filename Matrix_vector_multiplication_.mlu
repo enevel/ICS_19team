@@ -2,27 +2,24 @@
 #include <cnrt.h>
 #include <torch/extension.h>
 
-// 极限分块：16384 (占据 32KB FP16 / 65KB FP32)
-// 完美整除 K=131072，且保证 5 个核心缓冲总计仅占用 ~260KB NRAM (极度安全)
+// 极限分块：16384。完美整除 K=131072。
+// 3 个 FP32 数组总计占用约 192KB NRAM，极度安全，拉满单次计算吞吐量
 #define BK 16384
 
 // ---------------------------------------------------------
-// BANG C 原生核函数：极致优化的 GEMV 引擎
+// BANG C 原生核函数：纯血 FP32 高精度 GEMV 引擎
 // ---------------------------------------------------------
-__mlu_entry__ void gemv_kernel(const half* A, const half* B, half* C, int M, int K) {
-    // 1. NRAM 向量计算缓冲区
-    __nram__ half nram_A_h[BK];
-    __nram__ half nram_B_h[BK];
-    __nram__ float nram_A_f[BK];
-    __nram__ float nram_B_f[BK];
+__mlu_entry__ void gemv_float_kernel(const float* A, const float* B, float* C, int M, int K) {
+    // 1. NRAM 缓冲区 (全量使用 FP32 杜绝任何截断误差)
+    __nram__ float nram_A[BK];
+    __nram__ float nram_B[BK];
     __nram__ float nram_temp[BK];
 
-    // 2. 当前核心负责的行输出累加器 (FP32 保精度)
-    // 16核分发 256 行，单核最多 16 行。开辟 256 长度满足对齐需求。
+    // 2. 当前核心负责的行输出累加器
+    // 16 核分发 256 行，单核最多只处理 16 行。开辟 256 绝对充足。
     __nram__ float nram_row_sums[256];
-    __nram__ half nram_C_h[256];
 
-    // 计算当前核负责的行区间 [row_start, row_end)
+    // 计算当前核的任务区间 [row_start, row_end)
     int rows_per_core = (M + taskDim - 1) / taskDim;
     int row_start = taskId * rows_per_core;
     int row_end = row_start + rows_per_core;
@@ -36,78 +33,74 @@ __mlu_entry__ void gemv_kernel(const half* A, const half* B, half* C, int M, int
         nram_row_sums[i] = 0.0f;
     }
 
-    // 3. K 维度分块循环
+    // 3. 核心计算逻辑：K 维度切分
     for (int k_idx = 0; k_idx < K; k_idx += BK) {
         int current_bk = (K - k_idx) > BK ? BK : (K - k_idx);
 
-        // 🚀 核心优化：向量 B 缓存在 NRAM，当前核负责的所有 16 行共享！访存压力骤降 16 倍！
-        __memcpy(nram_B_h, B + k_idx, current_bk * sizeof(half), GDRAM2NRAM);
-        __bang_half2float(nram_B_f, nram_B_h, current_bk);
+        // 🚀 核心优化：高频缓存复用
+        // 向量 B 缓存在 NRAM 中，被该核心负责的所有 16 行共享！访存压力骤降！
+        __memcpy(nram_B, B + k_idx, current_bk * sizeof(float), GDRAM2NRAM);
 
-        // 遍历当前核负责的每一行矩阵 A
+        // 遍历当前核负责的矩阵 A 的每一行
         for (int r = 0; r < actual_rows; r++) {
             int global_row = row_start + r;
 
-            // 载入 A 的片段并升维至 FP32
-            __memcpy(nram_A_h, A + global_row * K + k_idx, current_bk * sizeof(half), GDRAM2NRAM);
-            __bang_half2float(nram_A_f, nram_A_h, current_bk);
+            // 载入 A 的片段
+            __memcpy(nram_A, A + global_row * K + k_idx, current_bk * sizeof(float), GDRAM2NRAM);
 
-            // 纯 FP32 向量按位乘法
-            __bang_mul(nram_temp, nram_A_f, nram_B_f, current_bk);
+            // FP32 向量按位乘法
+            __bang_mul(nram_temp, nram_A, nram_B, current_bk);
 
             // 🚀 核心优化：二叉树向量规约 (Binary Tree Reduction)
-            // 用向量 ALU 并行折叠数组，取代极慢的 for 循环标量相加
+            // 使用向量 ALU 折叠数组，取代极慢的标量 for 循环
             int span = current_bk / 2;
             while (span >= 64) {
                 __bang_add(nram_temp, nram_temp, nram_temp + span, span);
                 span /= 2;
             }
 
-            // 最后剩下的 64 个元素用标量累加 (已折叠至最小代价)
+            // 最后 64 个元素用标量累加扫尾 (已经是最优解)
             float chunk_sum = 0.0f;
             for (int s = 0; s < 64; s++) {
                 chunk_sum += nram_temp[s];
             }
 
-            // 累加进当前行的总 FP32 累加器中
+            // 累加进当前行
             nram_row_sums[r] += chunk_sum;
         }
     }
 
-    // 4. 将高精度结果降维并写回 GDRAM
-    // 将对齐长度设为 64 的倍数以满足 Float2Half 硬件指令需求
-    int align_rows = (actual_rows + 63) / 64 * 64;
-    __bang_float2half_rn(nram_C_h, nram_row_sums, align_rows);
-
-    __memcpy(C + row_start, nram_C_h, actual_rows * sizeof(half), NRAM2GDRAM);
+    // 4. 将高精度结果直接写回全局内存
+    __memcpy(C + row_start, nram_row_sums, actual_rows * sizeof(float), NRAM2GDRAM);
 }
 
 // ---------------------------------------------------------
-// PyTorch C++ Wrapper 接口
+// PyTorch C++ Wrapper 接口：动态适配数据类型
 // ---------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 强制转为 FP16 并确保存储物理连续
-    auto A_c = A.toType(torch::kHalf).contiguous();
-    auto B_c = B.toType(torch::kHalf).contiguous();
+    // 🌟 核心修复：尊重 Python 传下来的真实精度，不再强转 FP16
+    auto A_f = A.to(torch::kFloat32).contiguous();
+    auto B_f = B.to(torch::kFloat32).contiguous();
 
     int M = A.size(0);
     int K = A.size(1);
 
-    // 分配输出向量 [M, 1]
-    auto C = torch::empty({M, 1}, A.options().dtype(torch::kHalf));
+    // 输出同样在 FP32 下创建，接住核函数的完美精度结果
+    auto C_f = torch::empty({M, 1}, A.options().dtype(torch::kFloat32));
 
     uint32_t task_num = 16;
     cnrtDim3_t grid_dim = {task_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动原生纯血版 GEMV
-    gemv_kernel<<<grid_dim, ktype, queue>>>(
-        reinterpret_cast<const half*>(A_c.data_ptr()),
-        reinterpret_cast<const half*>(B_c.data_ptr()),
-        reinterpret_cast<half*>(C.data_ptr()),
+    // 启动纯血版浮点 GEMV 引擎
+    gemv_float_kernel<<<grid_dim, ktype, queue>>>(
+        reinterpret_cast<const float*>(A_f.data_ptr()),
+        reinterpret_cast<const float*>(B_f.data_ptr()),
+        reinterpret_cast<float*>(C_f.data_ptr()),
         M, K
     );
 
-    return C;
+    // 动态返回：原系统给的什么类型，我们就返回什么类型
+    return C_f.to(A.dtype());
 }
