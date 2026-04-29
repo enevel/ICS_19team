@@ -1,57 +1,119 @@
-#include <cmath>
-#include <stdint.h>
-#include <vector>
+#include <bang.h>
+#include <cnrt.h>
 #include <torch/extension.h>
-#include <torch/torch.h>
 
-torch::Tensor bang_func(torch::Tensor x,
-                        int in_channels,
-                        int out_channels,
-                        int kernel_size,
-                        int stride,
-                        int padding,
-                        int dilation,
-                        int groups,
-                        int bias) {
-    TORCH_CHECK(x.is_contiguous(), "Input tensor x must be contiguous");
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor x must be float16");
-    TORCH_CHECK(in_channels > 0, "in_channels must be positive");
-    TORCH_CHECK(out_channels > 0, "out_channels must be positive");
-    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
-    TORCH_CHECK(stride > 0, "stride must be positive");
-    TORCH_CHECK(dilation > 0, "dilation must be positive");
-    TORCH_CHECK(groups > 0, "groups must be positive");
-    TORCH_CHECK(in_channels % groups == 0, "in_channels must be divisible by groups");
+// 设定足够大的 NRAM 缓冲区上限 (8192 长度占据 16KB，极其安全)
+// 测试用例 length 为 512，完全可以整个装下。
+#define MAX_L 8192
+#define MAX_K 8192
 
-    int in_per_group = in_channels / groups;
-    auto cpu_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+// ---------------------------------------------------------
+// BANG C 原生核函数：标准一维卷积 (支持分组、膨胀、填充)
+// ---------------------------------------------------------
+__mlu_entry__ void conv1d_kernel(const half* x, const half* weight, half* out,
+                                 int batch, int in_channels, int out_channels, int length,
+                                 int kernel_size, int stride, int padding, int dilation, int groups, int L_out) {
+    
+    // NRAM 存储区：用于缓存当前通道的数据，避免极慢的 GDRAM 标量读取
+    __nram__ half nram_x[MAX_L];
+    __nram__ half nram_w[MAX_K];
+    __nram__ float nram_out_f32[MAX_L]; // FP32 高精度累加器
+    __nram__ half nram_out_h[MAX_L];    // 最终写回的 FP16 缓存
 
-    std::vector<int64_t> weight_shape;
-    weight_shape.push_back(out_channels);
-    weight_shape.push_back(in_per_group);
-    weight_shape.push_back(kernel_size);
+    int in_c_per_group = in_channels / groups;
+    int out_c_per_group = out_channels / groups;
 
-    torch::manual_seed(42);
-    auto weight_cpu = torch::empty(weight_shape, cpu_opts);
-    double bound = 1.0 / std::sqrt(static_cast<double>(in_per_group * kernel_size));
-    weight_cpu.uniform_(-bound, bound);
-    auto weight = weight_cpu.to(x.options());
+    // 将任务按 (batch * out_channels) 进行拆分，分配给各个计算核
+    int total_tasks = batch * out_channels;
+    
+    for (int task = taskId; task < total_tasks; task += taskDim) {
+        // 解析当前核负责的 Batch ID 和 输出通道 ID
+        int b = task / out_channels;
+        int oc = task % out_channels;
+        int g = oc / out_c_per_group; // 计算当前输出通道属于哪个 group
 
-    c10::optional<torch::Tensor> bias_tensor = c10::nullopt;
-    if (bias != 0) {
-        std::vector<int64_t> bias_shape;
-        bias_shape.push_back(out_channels);
-        auto bias_cpu = torch::empty(bias_shape, cpu_opts);
-        bias_cpu.uniform_(-bound, bound);
-        bias_tensor = bias_cpu.to(x.options());
+        // 1. 【载入权重】载入当前 oc 对应的所有输入通道权重
+        int weight_size = in_c_per_group * kernel_size;
+        __memcpy(nram_w, weight + oc * weight_size, weight_size * sizeof(half), GDRAM2NRAM);
+
+        // 2. 清空当前输出通道的 FP32 累加器
+        for (int i = 0; i < L_out; i++) {
+            nram_out_f32[i] = 0.0f;
+        }
+
+        // 3. 【卷积计算】遍历当前 group 内的每一个输入通道
+        for (int ic = 0; ic < in_c_per_group; ++ic) {
+            int global_ic = g * in_c_per_group + ic;
+
+            // 载入这一整条输入序列到片上
+            __memcpy(nram_x, x + (b * in_channels + global_ic) * length, length * sizeof(half), GDRAM2NRAM);
+
+            // 手工滑动窗口 (完美兼容 stride, padding, dilation)
+            for (int ow = 0; ow < L_out; ++ow) {
+                float sum = 0.0f;
+                for (int kw = 0; kw < kernel_size; ++kw) {
+                    // 计算对应的原图坐标
+                    int iw = ow * stride - padding + kw * dilation;
+                    
+                    // 边界安全检查 (自动处理 Padding)
+                    if (iw >= 0 && iw < length) {
+                        float xv = (float)nram_x[iw];
+                        float wv = (float)nram_w[ic * kernel_size + kw];
+                        sum += xv * wv;
+                    }
+                }
+                // 累加进高精度输出序列
+                nram_out_f32[ow] += sum;
+            }
+        }
+
+        // 4. 【数据降维与写回】
+        for (int i = 0; i < L_out; i++) {
+            nram_out_h[i] = (half)nram_out_f32[i]; // 转回 FP16
+        }
+        
+        // 批量拷贝回全局内存
+        __memcpy(out + (b * out_channels + oc) * L_out, nram_out_h, L_out * sizeof(half), NRAM2GDRAM);
     }
+}
 
-    std::vector<int64_t> stride_v;
-    std::vector<int64_t> padding_v;
-    std::vector<int64_t> dilation_v;
-    stride_v.push_back(stride);
-    padding_v.push_back(padding);
-    dilation_v.push_back(dilation);
+// ---------------------------------------------------------
+// PyTorch C++ Wrapper 接口
+// ---------------------------------------------------------
+torch::Tensor bang_func(torch::Tensor x, torch::Tensor kernel, 
+                        int in_channels, int out_channels, int kernel_size, 
+                        int stride, int padding, int dilation, int groups, int bias) {
+    
+    // 强制转换为 FP16 并确保存储连续
+    auto x_c = x.to(torch::kHalf).contiguous();
+    auto kernel_c = kernel.to(torch::kHalf).contiguous();
 
-    return torch::conv1d(x, weight, bias_tensor, stride_v, padding_v, dilation_v, groups);
+    int batch = x.size(0);
+    int length = x.size(2);
+
+    // 严谨计算一维卷积输出长度公式
+    int L_out = (length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+
+    // 创建输出张量 (FP16)
+    auto out = torch::empty({batch, out_channels, L_out}, x.options().dtype(torch::kHalf));
+
+    // 并发调度：如果任务量少于 16，则按实际任务量分配，否则跑满 16 核
+    int total_tasks = batch * out_channels;
+    uint32_t task_num = 16;
+    if (total_tasks < task_num) task_num = total_tasks;
+
+    cnrtDim3_t grid_dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 启动原生 BANG C 卷积引擎
+    conv1d_kernel<<<grid_dim, ktype, queue>>>(
+        reinterpret_cast<const half*>(x_c.data_ptr()),
+        reinterpret_cast<const half*>(kernel_c.data_ptr()),
+        reinterpret_cast<half*>(out.data_ptr()),
+        batch, in_channels, out_channels, length,
+        kernel_size, stride, padding, dilation, groups, L_out
+    );
+
+    return out;
 }
