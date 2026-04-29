@@ -1,0 +1,80 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define MAX_D2 256
+
+__mlu_entry__ void argmax_dim1_kernel(const half *input,
+                                      int64_t *output,
+                                      int B,
+                                      int D1,
+                                      int D2) {
+    uint32_t b = taskId;
+
+    if (b >= (uint32_t)B) {
+        return;
+    }
+
+    __nram__ half max_vals[MAX_D2];
+    __nram__ half row_vals[MAX_D2];
+    __nram__ int64_t max_idx[MAX_D2];
+
+    const half *base = input + b * D1 * D2;
+    __memcpy(max_vals, base, D2 * sizeof(half), GDRAM2NRAM);
+
+    for (int j = 0; j < D2; ++j) {
+        max_idx[j] = 0;
+    }
+
+    for (int k = 1; k < D1; ++k) {
+        const half *row_ptr = base + k * D2;
+
+        __memcpy(row_vals, row_ptr, D2 * sizeof(half), GDRAM2NRAM);
+
+        for (int j = 0; j < D2; ++j) {
+            float v = (float)row_vals[j];
+            float cur = (float)max_vals[j];
+
+            if (v > cur) {
+                max_vals[j] = row_vals[j];
+                max_idx[j] = (int64_t)k;
+            }
+        }
+    }
+
+    __memcpy(output + b * D2,
+             max_idx,
+             D2 * sizeof(int64_t),
+             NRAM2GDRAM);
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    TORCH_CHECK(x.is_contiguous(), "Input tensor x must be contiguous");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor x must be float16");
+    TORCH_CHECK(x.dim() == 3, "Input tensor x must be 3D");
+    TORCH_CHECK(dim == 1, "This implementation only supports dim = 1");
+
+    int B = static_cast<int>(x.size(0));
+    int D1 = static_cast<int>(x.size(1));
+    int D2 = static_cast<int>(x.size(2));
+
+    TORCH_CHECK(D2 <= MAX_D2, "D2 is too large for this implementation");
+
+    auto output = torch::empty({B, D2}, x.options().dtype(torch::kLong));
+
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtDim3_t k_dim = {static_cast<uint32_t>(B), 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    argmax_dim1_kernel<<<k_dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x.data_ptr()),
+        reinterpret_cast<int64_t *>(output.data_ptr()),
+        B,
+        D1,
+        D2
+    );
+
+    return output;
+}
