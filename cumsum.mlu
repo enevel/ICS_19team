@@ -1,75 +1,14 @@
-#include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
-#include <framework/core/MLUStream.h>
-
-#define BLOCK 64
-#define TASK_NUM 16
-
-__mlu_entry__ void cumsum_kernel(const half *x,
-                                 float *y,
-                                 int rows,
-                                 int cols) {
-    __nram__ half nram_h[BLOCK];
-    __nram__ float nram_f[BLOCK];
-
-    for (int row = taskId; row < rows; row += taskDim) {
-        int base = row * cols;
-        float running_sum = 0.0f;
-
-        for (int offset = 0; offset < cols; offset += BLOCK) {
-            int real_len = cols - offset;
-            if (real_len > BLOCK) {
-                real_len = BLOCK;
-            }
-
-            __memcpy(nram_h,
-                     x + base + offset,
-                     real_len * sizeof(half),
-                     GDRAM2NRAM);
-
-            for (int i = real_len; i < BLOCK; ++i) {
-                nram_h[i] = (half)0.0f;
-            }
-
-            __bang_half2float(nram_f, nram_h, BLOCK);
-
-            for (int i = 0; i < real_len; ++i) {
-                running_sum += nram_f[i];
-                nram_f[i] = running_sum;
-            }
-
-            __memcpy(y + base + offset,
-                     nram_f,
-                     real_len * sizeof(float),
-                     NRAM2GDRAM);
-        }
-    }
-}
+#include <iostream>
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
+    std::cout << "[DEBUG] x dtype: " << x.scalar_type() << std::endl;
+    std::cout << "[DEBUG] x dim: " << x.dim() << std::endl;
+    std::cout << "[DEBUG] input dim arg: " << dim << std::endl;
 
-    auto x_c = x.contiguous();
+    for (int i = 0; i < x.dim(); ++i) {
+        std::cout << "[DEBUG] size[" << i << "]: " << x.size(i) << std::endl;
+    }
 
-    int rows = x_c.size(0);
-    int cols = x_c.size(1);
-
-    auto out = torch::empty(
-        {rows, cols},
-        x_c.options().dtype(torch::kFloat32)
-    );
-
-    cnrtDim3_t grid_dim = {TASK_NUM, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    cumsum_kernel<<<grid_dim, ktype, queue>>>(
-        reinterpret_cast<const half *>(x_c.data_ptr()),
-        reinterpret_cast<float *>(out.data_ptr()),
-        rows,
-        cols
-    );
-
-    return out;
+    return torch::empty_like(x);
 }
