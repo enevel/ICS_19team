@@ -5,14 +5,15 @@
 #define TILE_ELEMS 1024
 
 __mlu_global__ void cumsum_kernel(const half *x,
-                                  half *y,
+                                  float *y,
                                   int rows,
                                   int cols) {
     __nram__ half nram_half[TILE_ELEMS];
+    __nram__ float nram_float[TILE_ELEMS];
 
     for (int row = taskId; row < rows; row += taskDim) {
         int base = row * cols;
-        half running_sum = (half)0.0f;
+        float running_sum = 0.0f;
 
         for (int offset = 0; offset < cols; offset += TILE_ELEMS) {
             int len = cols - offset;
@@ -25,14 +26,16 @@ __mlu_global__ void cumsum_kernel(const half *x,
                      len * sizeof(half),
                      GDRAM2NRAM);
 
+            __bang_half2float(nram_float, nram_half, len);
+
             for (int i = 0; i < len; ++i) {
-                running_sum = running_sum + nram_half[i];
-                nram_half[i] = running_sum;
+                running_sum += nram_float[i];
+                nram_float[i] = running_sum;
             }
 
             __memcpy(y + base + offset,
-                     nram_half,
-                     len * sizeof(half),
+                     nram_float,
+                     len * sizeof(float),
                      NRAM2GDRAM);
         }
     }
@@ -40,10 +43,14 @@ __mlu_global__ void cumsum_kernel(const half *x,
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
     auto x_contiguous = x.contiguous();
-    auto output = torch::empty_like(x_contiguous);
 
     int rows = x_contiguous.size(0);
     int cols = x_contiguous.size(1);
+
+    auto output = torch::empty(
+        {rows, cols},
+        x_contiguous.options().dtype(torch::kFloat32)
+    );
 
     int task_num = rows;
     if (task_num > 16) {
@@ -62,7 +69,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     cumsum_kernel<<<k_dim, k_type, queue>>>(
         reinterpret_cast<const half *>(x_contiguous.data_ptr()),
-        reinterpret_cast<half *>(output.data_ptr()),
+        reinterpret_cast<float *>(output.data_ptr()),
         rows,
         cols
     );
