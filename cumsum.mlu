@@ -4,36 +4,47 @@
 #include <framework/core/MLUStream.h>
 
 #define COLS 4000
+#define PAD_COLS 4096
 #define TASK_NUM 16
 
 __mlu_entry__ void cumsum_kernel(const half *x,
                                  half *y,
                                  int rows,
                                  int cols) {
-    __nram__ half nram_half[COLS];
-    __nram__ float nram_float[COLS];
+    __nram__ half nram_h[PAD_COLS];
+    __nram__ float nram_f[PAD_COLS];
+    __nram__ float nram_tmp[PAD_COLS];
 
     for (int row = taskId; row < rows; row += taskDim) {
         int base = row * cols;
 
-        __memcpy(nram_half,
+        __memcpy(nram_h,
                  x + base,
                  cols * sizeof(half),
                  GDRAM2NRAM);
 
-        __bang_half2float(nram_float, nram_half, cols);
-
-        float running_sum = 0.0f;
-
-        for (int i = 0; i < cols; ++i) {
-            running_sum += nram_float[i];
-            nram_float[i] = running_sum;
+        for (int i = cols; i < PAD_COLS; ++i) {
+            nram_h[i] = (half)0.0f;
         }
 
-        __bang_float2half_rn(nram_half, nram_float, cols);
+        __bang_half2float(nram_f, nram_h, PAD_COLS);
+
+        for (int step = 1; step < PAD_COLS; step <<= 1) {
+            __memcpy(nram_tmp,
+                     nram_f,
+                     PAD_COLS * sizeof(float),
+                     NRAM2NRAM);
+
+            __bang_add(nram_f + step,
+                       nram_tmp + step,
+                       nram_tmp,
+                       PAD_COLS - step);
+        }
+
+        __bang_float2half_rn(nram_h, nram_f, PAD_COLS);
 
         __memcpy(y + base,
-                 nram_half,
+                 nram_h,
                  cols * sizeof(half),
                  NRAM2GDRAM);
     }
