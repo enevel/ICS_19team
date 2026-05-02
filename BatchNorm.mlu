@@ -1,25 +1,21 @@
 #include <bang.h>
 #include <cnrt.h>
-#include <stdint.h>
-#include <math.h>
 #include <torch/extension.h>
-#include <torch_mlu/csrc/core/MLUStream.h>
+#include <math.h>
 
-#define TILE_ELEMS 4096
+#define TILE_ELEMS 1024
 #define EPS 1e-5f
 
-__mlu_entry__ void batchnorm_kernel(const half *input,
-                                    half *output,
-                                    int batch,
-                                    int channel,
-                                    int H,
-                                    int W) {
+__mlu_global__ void batchnorm_kernel(const float *x,
+                                     float *y,
+                                     int batch,
+                                     int channel,
+                                     int H,
+                                     int W) {
     int spatial = H * W;
     int num = batch * spatial;
 
-    __nram__ half nram_in[TILE_ELEMS];
-    __nram__ half nram_out[TILE_ELEMS];
-    __nram__ float nram_float[TILE_ELEMS];
+    __nram__ float nram_buf[TILE_ELEMS];
 
     for (int c = taskId; c < channel; c += taskDim) {
         float sum = 0.0f;
@@ -34,15 +30,13 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
                     len = TILE_ELEMS;
                 }
 
-                __memcpy(nram_in,
-                         input + base + offset,
-                         len * sizeof(half),
+                __memcpy(nram_buf,
+                         x + base + offset,
+                         len * sizeof(float),
                          GDRAM2NRAM);
 
-                __bang_half2float(nram_float, nram_in, len);
-
                 for (int i = 0; i < len; ++i) {
-                    float v = nram_float[i];
+                    float v = nram_buf[i];
                     sum += v;
                     square_sum += v * v;
                 }
@@ -67,22 +61,18 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
                     len = TILE_ELEMS;
                 }
 
-                __memcpy(nram_in,
-                         input + base + offset,
-                         len * sizeof(half),
+                __memcpy(nram_buf,
+                         x + base + offset,
+                         len * sizeof(float),
                          GDRAM2NRAM);
 
-                __bang_half2float(nram_float, nram_in, len);
-
                 for (int i = 0; i < len; ++i) {
-                    nram_float[i] = (nram_float[i] - mean) * inv_std;
+                    nram_buf[i] = (nram_buf[i] - mean) * inv_std;
                 }
 
-                __bang_float2half_rn(nram_out, nram_float, len);
-
-                __memcpy(output + base + offset,
-                         nram_out,
-                         len * sizeof(half),
+                __memcpy(y + base + offset,
+                         nram_buf,
+                         len * sizeof(float),
                          NRAM2GDRAM);
             }
         }
@@ -90,33 +80,40 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
 }
 
 torch::Tensor bang_func(torch::Tensor x, int num_features) {
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor must be float16");
+    auto x_contiguous = x.contiguous();
+    auto output = torch::empty_like(x_contiguous);
 
-    auto x_c = x.contiguous();
-    auto output = torch::empty_like(x_c);
-
-    int batch = x_c.size(0);
-    int channel = x_c.size(1);
-    int H = x_c.size(2);
-    int W = x_c.size(3);
+    int batch = x_contiguous.size(0);
+    int channel = x_contiguous.size(1);
+    int H = x_contiguous.size(2);
+    int W = x_contiguous.size(3);
 
     int task_num = channel;
     if (task_num > 16) {
         task_num = 16;
     }
 
-    cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
+    cnrtDim3_t dim;
+    dim.x = task_num;
+    dim.y = 1;
+    dim.z = 1;
+
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cnrtQueue_t queue;
+    cnrtQueueCreate(&queue);
 
     batchnorm_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<const half *>(x_c.data_ptr()),
-        reinterpret_cast<half *>(output.data_ptr()),
+        x_contiguous.data_ptr<float>(),
+        output.data_ptr<float>(),
         batch,
         channel,
         H,
         W
     );
+
+    cnrtQueueSync(queue);
+    cnrtQueueDestroy(queue);
 
     return output;
 }
