@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <framework/core/MLUStream.h>
 
+#define TILE_ELEMS 4096
 #define TASK_NUM 16
 
 __mlu_entry__ void cumsum_kernel(const half *x,
@@ -11,18 +12,51 @@ __mlu_entry__ void cumsum_kernel(const half *x,
                                  int dim_size,
                                  int inner_size,
                                  int total_lines) {
+    __nram__ half buf[TILE_ELEMS];
+
     for (int line = taskId; line < total_lines; line += taskDim) {
         int outer_idx = line / inner_size;
         int inner_idx = line % inner_size;
-
         int base = outer_idx * dim_size * inner_size + inner_idx;
 
-        float sum = 0.0f;
+        float running_sum = 0.0f;
 
-        for (int i = 0; i < dim_size; ++i) {
-            int idx = base + i * inner_size;
-            sum += (float)x[idx];
-            y[idx] = (half)sum;
+        for (int offset = 0; offset < dim_size; offset += TILE_ELEMS) {
+            int len = dim_size - offset;
+            if (len > TILE_ELEMS) {
+                len = TILE_ELEMS;
+            }
+
+            if (inner_size == 1) {
+                __memcpy(buf,
+                         x + base + offset,
+                         len * sizeof(half),
+                         GDRAM2NRAM);
+            } else {
+                for (int i = 0; i < len; ++i) {
+                    buf[i] = x[base + (offset + i) * inner_size];
+                }
+            }
+
+            for (int i = 0; i < len; ++i) {
+                running_sum += (float)buf[i];
+
+                half rounded = (half)running_sum;
+                buf[i] = rounded;
+
+                running_sum = (float)rounded;
+            }
+
+            if (inner_size == 1) {
+                __memcpy(y + base + offset,
+                         buf,
+                         len * sizeof(half),
+                         NRAM2GDRAM);
+            } else {
+                for (int i = 0; i < len; ++i) {
+                    y[base + (offset + i) * inner_size] = buf[i];
+                }
+            }
         }
     }
 }
