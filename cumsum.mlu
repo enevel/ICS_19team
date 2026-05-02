@@ -9,11 +9,10 @@ __mlu_global__ void cumsum_kernel(const half *x,
                                   int rows,
                                   int cols) {
     __nram__ half nram_half[TILE_ELEMS];
-    __nram__ float nram_float[TILE_ELEMS];
 
     for (int row = taskId; row < rows; row += taskDim) {
         int base = row * cols;
-        float running_sum = 0.0f;
+        half running_sum = (half)0.0f;
 
         for (int offset = 0; offset < cols; offset += TILE_ELEMS) {
             int len = cols - offset;
@@ -26,14 +25,10 @@ __mlu_global__ void cumsum_kernel(const half *x,
                      len * sizeof(half),
                      GDRAM2NRAM);
 
-            __bang_half2float(nram_float, nram_half, len);
-
             for (int i = 0; i < len; ++i) {
-                running_sum += nram_float[i];
-                nram_float[i] = running_sum;
+                running_sum = running_sum + nram_half[i];
+                nram_half[i] = running_sum;
             }
-
-            __bang_float2half_rn(nram_half, nram_float, len);
 
             __memcpy(y + base + offset,
                      nram_half,
