@@ -6,6 +6,7 @@
 #define COLS 4000
 #define PAD_COLS 4096
 #define TASK_NUM 16
+#define ALIGN 64
 
 __mlu_entry__ void cumsum_kernel(const half *x,
                                  half *y,
@@ -35,10 +36,19 @@ __mlu_entry__ void cumsum_kernel(const half *x,
                      PAD_COLS * sizeof(float),
                      NRAM2NRAM);
 
-            __bang_add(nram_f + step,
-                       nram_tmp + step,
-                       nram_tmp,
-                       PAD_COLS - step);
+            int len = PAD_COLS - step;
+            int vec_len = (len / ALIGN) * ALIGN;
+
+            if (vec_len > 0) {
+                __bang_add(nram_f + step,
+                           nram_tmp + step,
+                           nram_tmp,
+                           vec_len);
+            }
+
+            for (int i = vec_len; i < len; ++i) {
+                nram_f[step + i] = nram_tmp[step + i] + nram_tmp[i];
+            }
         }
 
         __bang_float2half_rn(nram_h, nram_f, PAD_COLS);
