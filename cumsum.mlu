@@ -1,0 +1,105 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <torch/extension.h>
+#include <math.h>
+
+#define TILE_ELEMS 1024
+
+__mlu_global__ void cumsum_kernel(const half *x,
+                                  half *y,
+                                  int outer_size,
+                                  int dim_size,
+                                  int inner_size,
+                                  int total_lines) {
+    __nram__ half nram_half[TILE_ELEMS];
+    __nram__ float nram_float[TILE_ELEMS];
+
+    for (int line = taskId; line < total_lines; line += taskDim) {
+        int outer_idx = line / inner_size;
+        int inner_idx = line % inner_size;
+
+        int base = outer_idx * dim_size * inner_size + inner_idx;
+
+        float running_sum = 0.0f;
+
+        for (int offset = 0; offset < dim_size; offset += TILE_ELEMS) {
+            int len = dim_size - offset;
+            if (len > TILE_ELEMS) {
+                len = TILE_ELEMS;
+            }
+
+            for (int i = 0; i < len; ++i) {
+                int index = base + (offset + i) * inner_size;
+                nram_half[i] = x[index];
+            }
+
+            __bang_half2float(nram_float, nram_half, len);
+
+            for (int i = 0; i < len; ++i) {
+                running_sum += nram_float[i];
+                nram_float[i] = running_sum;
+            }
+
+            __bang_float2half_rn(nram_half, nram_float, len);
+
+            for (int i = 0; i < len; ++i) {
+                int index = base + (offset + i) * inner_size;
+                y[index] = nram_half[i];
+            }
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x, int dim) {
+    auto x_contiguous = x.contiguous();
+    auto output = torch::empty_like(x_contiguous);
+
+    int ndim = x_contiguous.dim();
+
+    if (dim < 0) {
+        dim += ndim;
+    }
+
+    int outer_size = 1;
+    int dim_size = x_contiguous.size(dim);
+    int inner_size = 1;
+
+    for (int i = 0; i < dim; ++i) {
+        outer_size *= x_contiguous.size(i);
+    }
+
+    for (int i = dim + 1; i < ndim; ++i) {
+        inner_size *= x_contiguous.size(i);
+    }
+
+    int total_lines = outer_size * inner_size;
+
+    int task_num = total_lines;
+    if (task_num > 16) {
+        task_num = 16;
+    }
+
+    cnrtDim3_t k_dim;
+    k_dim.x = task_num;
+    k_dim.y = 1;
+    k_dim.z = 1;
+
+    cnrtFunctionType_t k_type = cnrtFuncTypeBlock;
+
+    cnrtQueue_t queue;
+    cnrtQueueCreate(&queue);
+
+    cumsum_kernel<<<k_dim, k_type, queue>>>(
+        reinterpret_cast<const half *>(x_contiguous.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
+        outer_size,
+        dim_size,
+        inner_size,
+        total_lines
+    );
+
+    cnrtQueueSync(queue);
+    cnrtQueueDestroy(queue);
+
+    return output;
+}
