@@ -1,14 +1,63 @@
+#include <bang.h>
+#include <cnrt.h>
 #include <torch/extension.h>
-#include <iostream>
+#include <framework/core/MLUStream.h>
+
+#define COLS 4000
+#define TASK_NUM 16
+
+__mlu_entry__ void cumsum_kernel(const half *x,
+                                 half *y,
+                                 int rows,
+                                 int cols) {
+    __nram__ half nram_half[COLS];
+    __nram__ float nram_float[COLS];
+
+    for (int row = taskId; row < rows; row += taskDim) {
+        int base = row * cols;
+
+        __memcpy(nram_half,
+                 x + base,
+                 cols * sizeof(half),
+                 GDRAM2NRAM);
+
+        __bang_half2float(nram_float, nram_half, cols);
+
+        float running_sum = 0.0f;
+
+        for (int i = 0; i < cols; ++i) {
+            running_sum += nram_float[i];
+            nram_float[i] = running_sum;
+        }
+
+        __bang_float2half_rn(nram_half, nram_float, cols);
+
+        __memcpy(y + base,
+                 nram_half,
+                 cols * sizeof(half),
+                 NRAM2GDRAM);
+    }
+}
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    std::cout << "[DEBUG] x dtype: " << x.scalar_type() << std::endl;
-    std::cout << "[DEBUG] x dim: " << x.dim() << std::endl;
-    std::cout << "[DEBUG] input dim arg: " << dim << std::endl;
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
 
-    for (int i = 0; i < x.dim(); ++i) {
-        std::cout << "[DEBUG] size[" << i << "]: " << x.size(i) << std::endl;
-    }
+    auto x_c = x.contiguous();
+    auto out = torch::empty_like(x_c);
 
-    return torch::empty_like(x);
+    int rows = x_c.size(0);
+    int cols = x_c.size(1);
+
+    cnrtDim3_t grid_dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    cumsum_kernel<<<grid_dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x_c.data_ptr()),
+        reinterpret_cast<half *>(out.data_ptr()),
+        rows,
+        cols
+    );
+
+    return out;
 }
