@@ -1,0 +1,121 @@
+#include <torch/extension.h>
+#include <torch_mlu/csrc/core/MLUStream.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <math.h>
+
+#define TILE_ELEMS 4096
+#define EPS 1e-5f
+
+__mlu_entry__ void batchnorm_kernel(const half *input,
+                                    half *output,
+                                    int batch,
+                                    int channel,
+                                    int H,
+                                    int W) {
+    int spatial = H * W;
+    int num = batch * spatial;
+
+    __nram__ half nram_in[TILE_ELEMS];
+    __nram__ half nram_out[TILE_ELEMS];
+    __nram__ float nram_float[TILE_ELEMS];
+
+    for (int c = taskId; c < channel; c += taskDim) {
+        float sum = 0.0f;
+        float square_sum = 0.0f;
+
+        for (int n = 0; n < batch; ++n) {
+            int base = (n * channel + c) * spatial;
+
+            for (int offset = 0; offset < spatial; offset += TILE_ELEMS) {
+                int len = spatial - offset;
+                if (len > TILE_ELEMS) {
+                    len = TILE_ELEMS;
+                }
+
+                __memcpy(nram_in,
+                         input + base + offset,
+                         len * sizeof(half),
+                         GDRAM2NRAM);
+
+                __bang_half2float(nram_float, nram_in, len);
+
+                for (int i = 0; i < len; ++i) {
+                    float v = nram_float[i];
+                    sum += v;
+                    square_sum += v * v;
+                }
+            }
+        }
+
+        float mean = sum / num;
+        float var = square_sum / num - mean * mean;
+        if (var < 0.0f) {
+            var = 0.0f;
+        }
+
+        float inv_std = 1.0f / sqrtf(var + EPS);
+
+        for (int n = 0; n < batch; ++n) {
+            int base = (n * channel + c) * spatial;
+
+            for (int offset = 0; offset < spatial; offset += TILE_ELEMS) {
+                int len = spatial - offset;
+                if (len > TILE_ELEMS) {
+                    len = TILE_ELEMS;
+                }
+
+                __memcpy(nram_in,
+                         input + base + offset,
+                         len * sizeof(half),
+                         GDRAM2NRAM);
+
+                __bang_half2float(nram_float, nram_in, len);
+
+                for (int i = 0; i < len; ++i) {
+                    nram_float[i] = (nram_float[i] - mean) * inv_std;
+                }
+
+                __bang_float2half_rn(nram_out, nram_float, len);
+
+                __memcpy(output + base + offset,
+                         nram_out,
+                         len * sizeof(half),
+                         NRAM2GDRAM);
+            }
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor input, int64_t num_features) {
+    TORCH_CHECK(input.dim() == 4, "Input tensor must be 4D");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf, "Input tensor must be float16");
+
+    auto x = input.contiguous();
+    auto output = torch::empty_like(x);
+
+    int batch = x.size(0);
+    int channel = x.size(1);
+    int H = x.size(2);
+    int W = x.size(3);
+
+    int task_num = channel;
+    if (task_num > 64) {
+        task_num = 64;
+    }
+
+    cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    batchnorm_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<half *>(x.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
+        batch,
+        channel,
+        H,
+        W
+    );
+
+    return output;
+}
