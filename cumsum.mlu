@@ -4,53 +4,36 @@
 #include <framework/core/MLUStream.h>
 
 #define COLS 4000
-#define COLS_PAD 4096
 #define TASK_NUM 16
 
 __mlu_entry__ void cumsum_kernel(const half *x,
                                  half *y,
                                  int rows,
                                  int cols) {
-    __nram__ half nram_half[COLS_PAD];
-    __nram__ float nram_float[COLS_PAD];
+    __nram__ half buf[COLS];
 
     for (int row = taskId; row < rows; row += taskDim) {
         int base = row * cols;
 
-        __memcpy(nram_half,
+        __memcpy(buf,
                  x + base,
                  cols * sizeof(half),
                  GDRAM2NRAM);
 
-        for (int i = cols; i < COLS_PAD; ++i) {
-            nram_half[i] = (half)0.0f;
+        for (int step = 1; step < cols; step <<= 1) {
+            for (int i = cols - 1; i >= step; --i) {
+                buf[i] = buf[i] + buf[i - step];
+            }
         }
-
-        __bang_half2float(nram_float, nram_half, COLS_PAD);
-
-        float sum = 0.0f;
-
-        for (int i = 0; i < cols; ++i) {
-            sum += nram_float[i];
-            nram_float[i] = sum;
-        }
-
-        for (int i = cols; i < COLS_PAD; ++i) {
-            nram_float[i] = 0.0f;
-        }
-
-        __bang_float2half_rn(nram_half, nram_float, COLS_PAD);
 
         __memcpy(y + base,
-                 nram_half,
+                 buf,
                  cols * sizeof(half),
                  NRAM2GDRAM);
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor must be float16");
-
     auto x_c = x.contiguous();
     auto out = torch::empty_like(x_c);
 
