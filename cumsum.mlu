@@ -1,7 +1,6 @@
 #include <bang.h>
 #include <cnrt.h>
 #include <torch/extension.h>
-#include <math.h>
 
 #define TILE_ELEMS 1024
 
@@ -11,8 +10,7 @@ __mlu_global__ void cumsum_kernel(const half *x,
                                   int dim_size,
                                   int inner_size,
                                   int total_lines) {
-    __nram__ half nram_half[TILE_ELEMS];
-    __nram__ float nram_float[TILE_ELEMS];
+    __nram__ half nram_buf[TILE_ELEMS];
 
     for (int line = taskId; line < total_lines; line += taskDim) {
         int outer_idx = line / inner_size;
@@ -20,7 +18,7 @@ __mlu_global__ void cumsum_kernel(const half *x,
 
         int base = outer_idx * dim_size * inner_size + inner_idx;
 
-        float running_sum = 0.0f;
+        half running_sum = (half)0.0f;
 
         for (int offset = 0; offset < dim_size; offset += TILE_ELEMS) {
             int len = dim_size - offset;
@@ -30,21 +28,17 @@ __mlu_global__ void cumsum_kernel(const half *x,
 
             for (int i = 0; i < len; ++i) {
                 int index = base + (offset + i) * inner_size;
-                nram_half[i] = x[index];
+                nram_buf[i] = x[index];
             }
-
-            __bang_half2float(nram_float, nram_half, len);
 
             for (int i = 0; i < len; ++i) {
-                running_sum += nram_float[i];
-                nram_float[i] = running_sum;
+                running_sum = running_sum + nram_buf[i];
+                nram_buf[i] = running_sum;
             }
-
-            __bang_float2half_rn(nram_half, nram_float, len);
 
             for (int i = 0; i < len; ++i) {
                 int index = base + (offset + i) * inner_size;
-                y[index] = nram_half[i];
+                y[index] = nram_buf[i];
             }
         }
     }
