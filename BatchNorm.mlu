@@ -6,8 +6,8 @@
 #define TILE_ELEMS 1024
 #define EPS 1e-5f
 
-__mlu_global__ void batchnorm_kernel(const float *x,
-                                     float *y,
+__mlu_global__ void batchnorm_kernel(const half *x,
+                                     half *y,
                                      int batch,
                                      int channel,
                                      int H,
@@ -15,7 +15,8 @@ __mlu_global__ void batchnorm_kernel(const float *x,
     int spatial = H * W;
     int num = batch * spatial;
 
-    __nram__ float nram_buf[TILE_ELEMS];
+    __nram__ half nram_half[TILE_ELEMS];
+    __nram__ float nram_float[TILE_ELEMS];
 
     for (int c = taskId; c < channel; c += taskDim) {
         float sum = 0.0f;
@@ -30,13 +31,15 @@ __mlu_global__ void batchnorm_kernel(const float *x,
                     len = TILE_ELEMS;
                 }
 
-                __memcpy(nram_buf,
+                __memcpy(nram_half,
                          x + base + offset,
-                         len * sizeof(float),
+                         len * sizeof(half),
                          GDRAM2NRAM);
 
+                __bang_half2float(nram_float, nram_half, len);
+
                 for (int i = 0; i < len; ++i) {
-                    float v = nram_buf[i];
+                    float v = nram_float[i];
                     sum += v;
                     square_sum += v * v;
                 }
@@ -61,18 +64,22 @@ __mlu_global__ void batchnorm_kernel(const float *x,
                     len = TILE_ELEMS;
                 }
 
-                __memcpy(nram_buf,
+                __memcpy(nram_half,
                          x + base + offset,
-                         len * sizeof(float),
+                         len * sizeof(half),
                          GDRAM2NRAM);
 
+                __bang_half2float(nram_float, nram_half, len);
+
                 for (int i = 0; i < len; ++i) {
-                    nram_buf[i] = (nram_buf[i] - mean) * inv_std;
+                    nram_float[i] = (nram_float[i] - mean) * inv_std;
                 }
 
+                __bang_float2half_rn(nram_half, nram_float, len);
+
                 __memcpy(y + base + offset,
-                         nram_buf,
-                         len * sizeof(float),
+                         nram_half,
+                         len * sizeof(half),
                          NRAM2GDRAM);
             }
         }
@@ -104,8 +111,8 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     cnrtQueueCreate(&queue);
 
     batchnorm_kernel<<<dim, ktype, queue>>>(
-        x_contiguous.data_ptr<float>(),
-        output.data_ptr<float>(),
+        reinterpret_cast<const half *>(x_contiguous.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
         batch,
         channel,
         H,
