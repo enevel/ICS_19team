@@ -10,31 +10,34 @@ __mlu_entry__ void cumsum_kernel(const half *x,
                                  half *y,
                                  int rows,
                                  int cols) {
-    __nram__ half nram_in[COLS];
-    __nram__ half nram_out[COLS];
+    __nram__ half nram_half[COLS];
     __nram__ float nram_float[COLS];
+    __nram__ float nram_tmp[COLS];
 
     for (int row = taskId; row < rows; row += taskDim) {
         int base = row * cols;
 
-        __memcpy(nram_in,
+        __memcpy(nram_half,
                  x + base,
                  cols * sizeof(half),
                  GDRAM2NRAM);
 
-        __bang_half2float(nram_float, nram_in, cols);
+        __bang_half2float(nram_float, nram_half, cols);
 
-        float sum = 0.0f;
+        for (int step = 1; step < cols; step <<= 1) {
+            for (int i = 0; i < cols; ++i) {
+                nram_tmp[i] = nram_float[i];
+            }
 
-        for (int i = 0; i < cols; ++i) {
-            sum += nram_float[i];
-            nram_float[i] = sum;
+            for (int i = step; i < cols; ++i) {
+                nram_float[i] = nram_float[i] + nram_tmp[i - step];
+            }
         }
 
-        __bang_float2half_rn(nram_out, nram_float, cols);
+        __bang_float2half_rn(nram_half, nram_float, cols);
 
         __memcpy(y + base,
-                 nram_out,
+                 nram_half,
                  cols * sizeof(half),
                  NRAM2GDRAM);
     }
