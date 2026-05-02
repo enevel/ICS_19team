@@ -1,8 +1,9 @@
-#include <torch/extension.h>
-#include <torch_mlu/csrc/core/MLUStream.h>
+#include <bang.h>
 #include <cnrt.h>
 #include <stdint.h>
 #include <math.h>
+#include <torch/extension.h>
+#include <torch_mlu/csrc/core/MLUStream.h>
 
 #define TILE_ELEMS 4096
 #define EPS 1e-5f
@@ -50,6 +51,7 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
 
         float mean = sum / num;
         float var = square_sum / num - mean * mean;
+
         if (var < 0.0f) {
             var = 0.0f;
         }
@@ -87,21 +89,20 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
     }
 }
 
-torch::Tensor bang_func(torch::Tensor input, int64_t num_features) {
-    TORCH_CHECK(input.dim() == 4, "Input tensor must be 4D");
-    TORCH_CHECK(input.scalar_type() == torch::kHalf, "Input tensor must be float16");
+torch::Tensor bang_func(torch::Tensor x, int num_features) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor must be float16");
 
-    auto x = input.contiguous();
-    auto output = torch::empty_like(x);
+    auto x_c = x.contiguous();
+    auto output = torch::empty_like(x_c);
 
-    int batch = x.size(0);
-    int channel = x.size(1);
-    int H = x.size(2);
-    int W = x.size(3);
+    int batch = x_c.size(0);
+    int channel = x_c.size(1);
+    int H = x_c.size(2);
+    int W = x_c.size(3);
 
     int task_num = channel;
-    if (task_num > 64) {
-        task_num = 64;
+    if (task_num > 16) {
+        task_num = 16;
     }
 
     cnrtDim3_t dim = {static_cast<unsigned int>(task_num), 1, 1};
@@ -109,7 +110,7 @@ torch::Tensor bang_func(torch::Tensor input, int64_t num_features) {
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     batchnorm_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half *>(x.data_ptr()),
+        reinterpret_cast<const half *>(x_c.data_ptr()),
         reinterpret_cast<half *>(output.data_ptr()),
         batch,
         channel,
