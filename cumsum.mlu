@@ -6,40 +6,39 @@
 
 __mlu_global__ void cumsum_kernel(const half *x,
                                   half *y,
-                                  int outer_size,
-                                  int dim_size,
-                                  int inner_size,
-                                  int total_lines) {
-    __nram__ half nram_buf[TILE_ELEMS];
+                                  int rows,
+                                  int cols) {
+    __nram__ half nram_half[TILE_ELEMS];
+    __nram__ float nram_float[TILE_ELEMS];
 
-    for (int line = taskId; line < total_lines; line += taskDim) {
-        int outer_idx = line / inner_size;
-        int inner_idx = line % inner_size;
+    for (int row = taskId; row < rows; row += taskDim) {
+        int base = row * cols;
+        float running_sum = 0.0f;
 
-        int base = outer_idx * dim_size * inner_size + inner_idx;
-
-        half running_sum = (half)0.0f;
-
-        for (int offset = 0; offset < dim_size; offset += TILE_ELEMS) {
-            int len = dim_size - offset;
+        for (int offset = 0; offset < cols; offset += TILE_ELEMS) {
+            int len = cols - offset;
             if (len > TILE_ELEMS) {
                 len = TILE_ELEMS;
             }
 
-            for (int i = 0; i < len; ++i) {
-                int index = base + (offset + i) * inner_size;
-                nram_buf[i] = x[index];
-            }
+            __memcpy(nram_half,
+                     x + base + offset,
+                     len * sizeof(half),
+                     GDRAM2NRAM);
+
+            __bang_half2float(nram_float, nram_half, len);
 
             for (int i = 0; i < len; ++i) {
-                running_sum = running_sum + nram_buf[i];
-                nram_buf[i] = running_sum;
+                running_sum += nram_float[i];
+                nram_float[i] = running_sum;
             }
 
-            for (int i = 0; i < len; ++i) {
-                int index = base + (offset + i) * inner_size;
-                y[index] = nram_buf[i];
-            }
+            __bang_float2half_rn(nram_half, nram_float, len);
+
+            __memcpy(y + base + offset,
+                     nram_half,
+                     len * sizeof(half),
+                     NRAM2GDRAM);
         }
     }
 }
@@ -48,27 +47,10 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     auto x_contiguous = x.contiguous();
     auto output = torch::empty_like(x_contiguous);
 
-    int ndim = x_contiguous.dim();
+    int rows = x_contiguous.size(0);
+    int cols = x_contiguous.size(1);
 
-    if (dim < 0) {
-        dim += ndim;
-    }
-
-    int outer_size = 1;
-    int dim_size = x_contiguous.size(dim);
-    int inner_size = 1;
-
-    for (int i = 0; i < dim; ++i) {
-        outer_size *= x_contiguous.size(i);
-    }
-
-    for (int i = dim + 1; i < ndim; ++i) {
-        inner_size *= x_contiguous.size(i);
-    }
-
-    int total_lines = outer_size * inner_size;
-
-    int task_num = total_lines;
+    int task_num = rows;
     if (task_num > 16) {
         task_num = 16;
     }
@@ -86,10 +68,8 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     cumsum_kernel<<<k_dim, k_type, queue>>>(
         reinterpret_cast<const half *>(x_contiguous.data_ptr()),
         reinterpret_cast<half *>(output.data_ptr()),
-        outer_size,
-        dim_size,
-        inner_size,
-        total_lines
+        rows,
+        cols
     );
 
     cnrtQueueSync(queue);
