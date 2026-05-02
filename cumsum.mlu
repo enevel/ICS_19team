@@ -3,34 +3,27 @@
 #include <torch/extension.h>
 #include <framework/core/MLUStream.h>
 
-#define COLS 4000
 #define TASK_NUM 16
 
 __mlu_entry__ void cumsum_kernel(const half *x,
                                  half *y,
-                                 int rows,
-                                 int cols) {
-    __nram__ half buf[COLS];
+                                 int outer_size,
+                                 int dim_size,
+                                 int inner_size,
+                                 int total_lines) {
+    for (int line = taskId; line < total_lines; line += taskDim) {
+        int outer_idx = line / inner_size;
+        int inner_idx = line % inner_size;
 
-    for (int row = taskId; row < rows; row += taskDim) {
-        int base = row * cols;
-
-        __memcpy(buf,
-                 x + base,
-                 cols * sizeof(half),
-                 GDRAM2NRAM);
+        int base = outer_idx * dim_size * inner_size + inner_idx;
 
         float sum = 0.0f;
 
-        for (int i = 0; i < cols; ++i) {
-            sum += (float)buf[i];
-            buf[i] = (half)sum;
+        for (int i = 0; i < dim_size; ++i) {
+            int idx = base + i * inner_size;
+            sum += (float)x[idx];
+            y[idx] = (half)sum;
         }
-
-        __memcpy(y + base,
-                 buf,
-                 cols * sizeof(half),
-                 NRAM2GDRAM);
     }
 }
 
@@ -40,18 +33,37 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
     auto x_c = x.contiguous();
     auto out = torch::empty_like(x_c);
 
-    int rows = x_c.size(0);
-    int cols = x_c.size(1);
+    int ndim = x_c.dim();
 
-    cnrtDim3_t dim3 = {TASK_NUM, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    if (dim < 0) {
+        dim += ndim;
+    }
+
+    int outer_size = 1;
+    int dim_size = x_c.size(dim);
+    int inner_size = 1;
+
+    for (int i = 0; i < dim; ++i) {
+        outer_size *= x_c.size(i);
+    }
+
+    for (int i = dim + 1; i < ndim; ++i) {
+        inner_size *= x_c.size(i);
+    }
+
+    int total_lines = outer_size * inner_size;
+
+    cnrtDim3_t k_dim = {TASK_NUM, 1, 1};
+    cnrtFunctionType_t k_type = cnrtFuncTypeBlock;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cumsum_kernel<<<dim3, ktype, queue>>>(
+    cumsum_kernel<<<k_dim, k_type, queue>>>(
         reinterpret_cast<const half *>(x_c.data_ptr()),
         reinterpret_cast<half *>(out.data_ptr()),
-        rows,
-        cols
+        outer_size,
+        dim_size,
+        inner_size,
+        total_lines
     );
 
     return out;
