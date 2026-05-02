@@ -12,10 +12,11 @@ __mlu_entry__ void cumsum_kernel(const half *x,
                                  int cols) {
     __nram__ half buf_half[BLOCK];
     __nram__ float buf_float[BLOCK];
+    __nram__ float buf_tmp[BLOCK];
 
     for (int row = taskId; row < rows; row += taskDim) {
         int base = row * cols;
-        float running_sum = 0.0f;
+        float block_offset = 0.0f;
 
         for (int offset = 0; offset < cols; offset += BLOCK) {
             int real_len = cols - offset;
@@ -34,10 +35,21 @@ __mlu_entry__ void cumsum_kernel(const half *x,
 
             __bang_half2float(buf_float, buf_half, BLOCK);
 
-            for (int i = 0; i < real_len; ++i) {
-                running_sum += buf_float[i];
-                buf_float[i] = running_sum;
+            for (int step = 1; step < BLOCK; step <<= 1) {
+                for (int i = 0; i < BLOCK; ++i) {
+                    buf_tmp[i] = buf_float[i];
+                }
+
+                for (int i = step; i < BLOCK; ++i) {
+                    buf_float[i] = buf_float[i] + buf_tmp[i - step];
+                }
             }
+
+            for (int i = 0; i < real_len; ++i) {
+                buf_float[i] = buf_float[i] + block_offset;
+            }
+
+            block_offset = buf_float[real_len - 1];
 
             for (int i = real_len; i < BLOCK; ++i) {
                 buf_float[i] = 0.0f;
