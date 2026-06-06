@@ -1,0 +1,175 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+#include <vector>
+
+#define MAX_TASKS 64
+#define NEG_INF (-3.4028234663852886e+38F)
+
+__mlu_entry__ void topk_float_kernel(const float *x,
+                                     float *values,
+                                     int64_t *indices,
+                                     int64_t batch,
+                                     int64_t dim_size,
+                                     int64_t k,
+                                     int64_t op_dim) {
+    int64_t work_items = op_dim == 1 ? batch : dim_size;
+
+    for (int64_t item = taskId; item < work_items; item += taskDim) {
+        for (int64_t rank = 0; rank < k; ++rank) {
+            float best_value = NEG_INF;
+            int64_t best_index = 0;
+            int found = 0;
+            int64_t reduce_size = op_dim == 1 ? dim_size : batch;
+
+            for (int64_t i = 0; i < reduce_size; ++i) {
+                int selected = 0;
+                for (int64_t prev = 0; prev < rank; ++prev) {
+                    int64_t prev_index = op_dim == 1
+                                             ? indices[item * k + prev]
+                                             : indices[prev * dim_size + item];
+                    if (prev_index == i) {
+                        selected = 1;
+                        break;
+                    }
+                }
+                if (selected) {
+                    continue;
+                }
+
+                float candidate = op_dim == 1 ? x[item * dim_size + i]
+                                              : x[i * dim_size + item];
+                if (!found || candidate > best_value ||
+                    (candidate == best_value && i < best_index)) {
+                    best_value = candidate;
+                    best_index = i;
+                    found = 1;
+                }
+            }
+
+            if (op_dim == 1) {
+                values[item * k + rank] = best_value;
+                indices[item * k + rank] = best_index;
+            } else {
+                values[rank * dim_size + item] = best_value;
+                indices[rank * dim_size + item] = best_index;
+            }
+        }
+    }
+}
+
+__mlu_entry__ void topk_half_kernel(const half *x,
+                                    half *values,
+                                    int64_t *indices,
+                                    int64_t batch,
+                                    int64_t dim_size,
+                                    int64_t k,
+                                    int64_t op_dim) {
+    int64_t work_items = op_dim == 1 ? batch : dim_size;
+
+    for (int64_t item = taskId; item < work_items; item += taskDim) {
+        for (int64_t rank = 0; rank < k; ++rank) {
+            float best_value = NEG_INF;
+            half best_half = (half)0.0f;
+            int64_t best_index = 0;
+            int found = 0;
+            int64_t reduce_size = op_dim == 1 ? dim_size : batch;
+
+            for (int64_t i = 0; i < reduce_size; ++i) {
+                int selected = 0;
+                for (int64_t prev = 0; prev < rank; ++prev) {
+                    int64_t prev_index = op_dim == 1
+                                             ? indices[item * k + prev]
+                                             : indices[prev * dim_size + item];
+                    if (prev_index == i) {
+                        selected = 1;
+                        break;
+                    }
+                }
+                if (selected) {
+                    continue;
+                }
+
+                half candidate_half = op_dim == 1 ? x[item * dim_size + i]
+                                                  : x[i * dim_size + item];
+                float candidate = (float)candidate_half;
+                if (!found || candidate > best_value ||
+                    (candidate == best_value && i < best_index)) {
+                    best_value = candidate;
+                    best_half = candidate_half;
+                    best_index = i;
+                    found = 1;
+                }
+            }
+
+            if (op_dim == 1) {
+                values[item * k + rank] = best_half;
+                indices[item * k + rank] = best_index;
+            } else {
+                values[rank * dim_size + item] = best_half;
+                indices[rank * dim_size + item] = best_index;
+            }
+        }
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int64_t k, int64_t dim) {
+    TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor with shape [batch, dim]");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 ||
+                    x.scalar_type() == torch::kHalf,
+                "x must be float32 or float16");
+    TORCH_CHECK(dim == 0 || dim == 1 || dim == -1 || dim == -2,
+                "dim must be 0, 1, -1, or -2");
+    int64_t op_dim = dim < 0 ? dim + 2 : dim;
+
+    int64_t batch = x.size(0);
+    int64_t dim_size = x.size(1);
+    int64_t reduce_size = op_dim == 1 ? dim_size : batch;
+
+    TORCH_CHECK(k >= 0, "k must be non-negative");
+    TORCH_CHECK(k <= reduce_size, "k must not exceed the selected dimension size");
+
+    auto x_c = x.contiguous();
+    std::vector<int64_t> out_shape;
+    if (op_dim == 1) {
+        out_shape = {batch, k};
+    } else {
+        out_shape = {k, dim_size};
+    }
+
+    auto values = torch::empty(out_shape, x_c.options());
+    auto indices = torch::empty(out_shape, x_c.options().dtype(torch::kInt64));
+    if (k == 0 || batch == 0 || dim_size == 0) {
+        return {values, indices};
+    }
+
+    int64_t work_items = op_dim == 1 ? batch : dim_size;
+    uint32_t task_num = static_cast<uint32_t>(
+        work_items < MAX_TASKS ? work_items : MAX_TASKS);
+    cnrtDim3_t k_dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    if (x_c.scalar_type() == torch::kFloat32) {
+        topk_float_kernel<<<k_dim, ktype, queue>>>(
+            reinterpret_cast<const float *>(x_c.data_ptr()),
+            reinterpret_cast<float *>(values.data_ptr()),
+            reinterpret_cast<int64_t *>(indices.data_ptr()),
+            batch,
+            dim_size,
+            k,
+            op_dim);
+    } else {
+        topk_half_kernel<<<k_dim, ktype, queue>>>(
+            reinterpret_cast<const half *>(x_c.data_ptr()),
+            reinterpret_cast<half *>(values.data_ptr()),
+            reinterpret_cast<int64_t *>(indices.data_ptr()),
+            batch,
+            dim_size,
+            k,
+            op_dim);
+    }
+
+    return {values, indices};
+}

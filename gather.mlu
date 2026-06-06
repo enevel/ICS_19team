@@ -1,0 +1,240 @@
+#include <bang.h>
+#include <c10/util/Optional.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define TILE_ELEMS 4096
+#define MAX_TASKS 64
+
+__mlu_entry__ void gather_with_bins_float_kernel(const float *x,
+                                                 const int64_t *indices,
+                                                 const int64_t *bin_ids,
+                                                 const float *weights,
+                                                 const int64_t *bins,
+                                                 float *out,
+                                                 int64_t tokens,
+                                                 int64_t hidden_size,
+                                                 int64_t num_elements,
+                                                 int64_t top_k,
+                                                 int has_weights) {
+    __nram__ float tile[TILE_ELEMS];
+
+    for (int64_t row = taskId; row < num_elements; row += taskDim) {
+        int64_t flat_index = indices[row];
+        int64_t bin_id = bin_ids[row];
+        int64_t bin_start = bin_id > 0 ? bins[bin_id - 1] : 0;
+        int64_t dst_row = row - bin_start + bin_start;
+
+        if (flat_index < 0 || flat_index >= num_elements ||
+            dst_row < 0 || dst_row >= num_elements || top_k <= 0) {
+            for (int64_t col = 0; col < hidden_size; col += TILE_ELEMS) {
+                uint32_t len = static_cast<uint32_t>(hidden_size - col);
+                if (len > TILE_ELEMS) {
+                    len = TILE_ELEMS;
+                }
+                __bang_write_value(tile, len, 0.0f);
+                __memcpy(out + row * hidden_size + col,
+                         tile,
+                         len * sizeof(float),
+                         NRAM2GDRAM);
+            }
+            continue;
+        }
+
+        int64_t src_row = flat_index / top_k;
+        if (src_row < 0 || src_row >= tokens) {
+            for (int64_t col = 0; col < hidden_size; col += TILE_ELEMS) {
+                uint32_t len = static_cast<uint32_t>(hidden_size - col);
+                if (len > TILE_ELEMS) {
+                    len = TILE_ELEMS;
+                }
+                __bang_write_value(tile, len, 0.0f);
+                __memcpy(out + dst_row * hidden_size + col,
+                         tile,
+                         len * sizeof(float),
+                         NRAM2GDRAM);
+            }
+            continue;
+        }
+
+        float scale = has_weights ? weights[flat_index] : 1.0f;
+        for (int64_t col = 0; col < hidden_size; col += TILE_ELEMS) {
+            uint32_t len = static_cast<uint32_t>(hidden_size - col);
+            if (len > TILE_ELEMS) {
+                len = TILE_ELEMS;
+            }
+
+            __memcpy(tile,
+                     x + src_row * hidden_size + col,
+                     len * sizeof(float),
+                     GDRAM2NRAM);
+            if (has_weights) {
+                __bang_mul_scalar(tile, tile, scale, len);
+            }
+            __memcpy(out + dst_row * hidden_size + col,
+                     tile,
+                     len * sizeof(float),
+                     NRAM2GDRAM);
+        }
+    }
+}
+
+__mlu_entry__ void gather_with_bins_half_kernel(const half *x,
+                                                const int64_t *indices,
+                                                const int64_t *bin_ids,
+                                                const float *weights,
+                                                const int64_t *bins,
+                                                half *out,
+                                                int64_t tokens,
+                                                int64_t hidden_size,
+                                                int64_t num_elements,
+                                                int64_t top_k,
+                                                int has_weights) {
+    __nram__ half tile[TILE_ELEMS];
+
+    for (int64_t row = taskId; row < num_elements; row += taskDim) {
+        int64_t flat_index = indices[row];
+        int64_t bin_id = bin_ids[row];
+        int64_t bin_start = bin_id > 0 ? bins[bin_id - 1] : 0;
+        int64_t dst_row = row - bin_start + bin_start;
+
+        if (flat_index < 0 || flat_index >= num_elements ||
+            dst_row < 0 || dst_row >= num_elements || top_k <= 0) {
+            for (int64_t col = 0; col < hidden_size; col += TILE_ELEMS) {
+                uint32_t len = static_cast<uint32_t>(hidden_size - col);
+                if (len > TILE_ELEMS) {
+                    len = TILE_ELEMS;
+                }
+                __bang_write_value(tile, len, (half)0.0f);
+                __memcpy(out + row * hidden_size + col,
+                         tile,
+                         len * sizeof(half),
+                         NRAM2GDRAM);
+            }
+            continue;
+        }
+
+        int64_t src_row = flat_index / top_k;
+        if (src_row < 0 || src_row >= tokens) {
+            for (int64_t col = 0; col < hidden_size; col += TILE_ELEMS) {
+                uint32_t len = static_cast<uint32_t>(hidden_size - col);
+                if (len > TILE_ELEMS) {
+                    len = TILE_ELEMS;
+                }
+                __bang_write_value(tile, len, (half)0.0f);
+                __memcpy(out + dst_row * hidden_size + col,
+                         tile,
+                         len * sizeof(half),
+                         NRAM2GDRAM);
+            }
+            continue;
+        }
+
+        half scale = has_weights ? (half)weights[flat_index] : (half)1.0f;
+        for (int64_t col = 0; col < hidden_size; col += TILE_ELEMS) {
+            uint32_t len = static_cast<uint32_t>(hidden_size - col);
+            if (len > TILE_ELEMS) {
+                len = TILE_ELEMS;
+            }
+
+            __memcpy(tile,
+                     x + src_row * hidden_size + col,
+                     len * sizeof(half),
+                     GDRAM2NRAM);
+            if (has_weights) {
+                __bang_mul_scalar(tile, tile, scale, len);
+            }
+            __memcpy(out + dst_row * hidden_size + col,
+                     tile,
+                     len * sizeof(half),
+                     NRAM2GDRAM);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x,
+                        torch::Tensor indices,
+                        torch::Tensor bin_ids,
+                        c10::optional<torch::Tensor> weights,
+                        torch::Tensor bins,
+                        int64_t top_k) {
+    TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
+    TORCH_CHECK(indices.dim() == 1, "indices must be a 1D tensor");
+    TORCH_CHECK(bin_ids.dim() == 1, "bin_ids must be a 1D tensor");
+    TORCH_CHECK(bins.dim() == 1, "bins must be a 1D tensor");
+    TORCH_CHECK(top_k > 0, "top_k must be positive");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 ||
+                    x.scalar_type() == torch::kHalf,
+                "x must be float32 or float16");
+
+    auto x_c = x.contiguous();
+    auto indices_c = indices.to(torch::kInt64).contiguous();
+    auto bin_ids_c = bin_ids.to(torch::kInt64).contiguous();
+    auto bins_c = bins.to(torch::kInt64).contiguous();
+
+    int64_t tokens = x_c.size(0);
+    int64_t hidden_size = x_c.size(1);
+    int64_t num_elements = indices_c.numel();
+    TORCH_CHECK(tokens == 0 || top_k <= INT64_MAX / tokens,
+                "output size overflow");
+    int64_t output_rows = tokens * top_k;
+
+    TORCH_CHECK(num_elements == output_rows,
+                "indices length must equal tokens * top_k");
+    TORCH_CHECK(bin_ids_c.numel() == num_elements,
+                "bin_ids length must match indices length");
+    int has_weights = 0;
+    torch::Tensor weights_c;
+    if (weights.has_value() && weights.value().defined() &&
+        weights.value().numel() > 0) {
+        TORCH_CHECK(weights.value().dim() == 1, "weights must be a 1D tensor");
+        TORCH_CHECK(weights.value().numel() == num_elements,
+                    "weights length must match indices length");
+        weights_c = weights.value().to(torch::kFloat32).contiguous();
+        has_weights = 1;
+    } else {
+        weights_c = torch::empty({1}, x_c.options().dtype(torch::kFloat32));
+    }
+
+    auto out = torch::empty({output_rows, hidden_size}, x_c.options());
+    if (num_elements == 0 || hidden_size == 0) {
+        return out;
+    }
+
+    uint32_t task_num = static_cast<uint32_t>(
+        num_elements < MAX_TASKS ? num_elements : MAX_TASKS);
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    if (x_c.scalar_type() == torch::kFloat32) {
+        gather_with_bins_float_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const float *>(x_c.data_ptr()),
+            reinterpret_cast<const int64_t *>(indices_c.data_ptr()),
+            reinterpret_cast<const int64_t *>(bin_ids_c.data_ptr()),
+            reinterpret_cast<const float *>(weights_c.data_ptr()),
+            reinterpret_cast<const int64_t *>(bins_c.data_ptr()),
+            reinterpret_cast<float *>(out.data_ptr()),
+            tokens,
+            hidden_size,
+            num_elements,
+            top_k,
+            has_weights);
+    } else {
+        gather_with_bins_half_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const half *>(x_c.data_ptr()),
+            reinterpret_cast<const int64_t *>(indices_c.data_ptr()),
+            reinterpret_cast<const int64_t *>(bin_ids_c.data_ptr()),
+            reinterpret_cast<const float *>(weights_c.data_ptr()),
+            reinterpret_cast<const int64_t *>(bins_c.data_ptr()),
+            reinterpret_cast<half *>(out.data_ptr()),
+            tokens,
+            hidden_size,
+            num_elements,
+            top_k,
+            has_weights);
+    }
+
+    return out;
+}

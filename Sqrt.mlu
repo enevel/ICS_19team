@@ -1,0 +1,132 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <math.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define TILE_ELEMS 4096
+#define TASK_ELEMS (TILE_ELEMS * 8)
+
+__mlu_entry__ void sqrt_abs_float_kernel(const float *x,
+                                         float *out,
+                                         int64_t total) {
+    __nram__ float tile[TILE_ELEMS];
+
+    int64_t stride = static_cast<int64_t>(taskDim) * TASK_ELEMS;
+    if (stride <= 0) {
+        return;
+    }
+
+    for (int64_t start = taskId * TASK_ELEMS;
+         start < total;
+         start += stride) {
+        int64_t count = total - start;
+        if (count > TASK_ELEMS) {
+            count = TASK_ELEMS;
+        }
+
+        for (int64_t offset = 0; offset < count; offset += TILE_ELEMS) {
+            uint32_t len = static_cast<uint32_t>(count - offset);
+            if (len > TILE_ELEMS) {
+                len = TILE_ELEMS;
+            }
+
+            __memcpy(tile,
+                     x + start + offset,
+                     len * sizeof(float),
+                     GDRAM2NRAM);
+
+            for (uint32_t i = 0; i < len; ++i) {
+                float value = tile[i];
+                tile[i] = sqrtf(value < 0.0f ? -value : value);
+            }
+
+            __memcpy(out + start + offset,
+                     tile,
+                     len * sizeof(float),
+                     NRAM2GDRAM);
+        }
+    }
+}
+
+__mlu_entry__ void sqrt_abs_half_kernel(const half *x,
+                                        half *out,
+                                        int64_t total) {
+    __nram__ half half_tile[TILE_ELEMS];
+    __nram__ float float_tile[TILE_ELEMS];
+
+    int64_t stride = static_cast<int64_t>(taskDim) * TASK_ELEMS;
+    if (stride <= 0) {
+        return;
+    }
+
+    for (int64_t start = taskId * TASK_ELEMS;
+         start < total;
+         start += stride) {
+        int64_t count = total - start;
+        if (count > TASK_ELEMS) {
+            count = TASK_ELEMS;
+        }
+
+        for (int64_t offset = 0; offset < count; offset += TILE_ELEMS) {
+            uint32_t len = static_cast<uint32_t>(count - offset);
+            if (len > TILE_ELEMS) {
+                len = TILE_ELEMS;
+            }
+
+            __memcpy(half_tile,
+                     x + start + offset,
+                     len * sizeof(half),
+                     GDRAM2NRAM);
+            __bang_half2float(float_tile, half_tile, len);
+
+            for (uint32_t i = 0; i < len; ++i) {
+                float value = float_tile[i];
+                float_tile[i] = sqrtf(value < 0.0f ? -value : value);
+            }
+
+            __bang_float2half_rn(half_tile, float_tile, len);
+            __memcpy(out + start + offset,
+                     half_tile,
+                     len * sizeof(half),
+                     NRAM2GDRAM);
+        }
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor with shape [batch_size, dim]");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32 ||
+                    x.scalar_type() == torch::kHalf,
+                "x must be float32 or float16");
+
+    auto x_c = x.contiguous();
+    auto out = torch::empty_like(x_c);
+    int64_t total = x_c.numel();
+    if (total == 0) {
+        return out;
+    }
+
+    int64_t task_num_64 = (total + TASK_ELEMS - 1) / TASK_ELEMS;
+    if (task_num_64 > 64) {
+        task_num_64 = 64;
+    }
+
+    cnrtDim3_t dim = {static_cast<uint32_t>(task_num_64), 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    if (x_c.scalar_type() == torch::kFloat32) {
+        sqrt_abs_float_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const float *>(x_c.data_ptr()),
+            reinterpret_cast<float *>(out.data_ptr()),
+            total);
+    } else {
+        sqrt_abs_half_kernel<<<dim, ktype, queue>>>(
+            reinterpret_cast<const half *>(x_c.data_ptr()),
+            reinterpret_cast<half *>(out.data_ptr()),
+            total);
+    }
+
+    return out;
+}
