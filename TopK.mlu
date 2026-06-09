@@ -1,0 +1,118 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define ALIGN_NUM 64
+#define MAX_DIM 16384
+#define MAX_K 512
+
+__mlu_func__ int align_up(int x, int align) {
+    return (x + align - 1) / align * align;
+}
+
+__mlu_entry__ void topk_kernel(const half *input,
+                               half *out_values,
+                               int64_t *out_indices,
+                               int batch,
+                               int dim_size,
+                               int k) {
+    __nram__ half nram_row[MAX_DIM];
+    __nram__ float nram_f[MAX_DIM];
+    __nram__ float nram_tmp[MAX_DIM];
+    __nram__ half result_vals[MAX_K];
+    __nram__ int64_t result_idx[MAX_K];
+
+    int pad_dim = align_up(dim_size, ALIGN_NUM);
+
+    for (int b = taskId; b < batch; b += taskDim) {
+        const half *row_ptr = input + (int64_t)b * dim_size;
+
+        __memcpy(nram_row, row_ptr, dim_size * sizeof(half), GDRAM2NRAM);
+
+        for (int i = dim_size; i < pad_dim; ++i) {
+            nram_row[i] = (half)(-65504.0f);
+        }
+
+        __bang_half2float(nram_f, nram_row, pad_dim);
+
+        for (int t = 0; t < k; ++t) {
+            __memcpy(nram_tmp, nram_f, pad_dim * sizeof(float), NRAM2NRAM);
+
+            for (int step = pad_dim / 2; step >= ALIGN_NUM; step /= 2) {
+                __bang_maxequal(nram_tmp, nram_tmp, nram_tmp + step, step);
+            }
+
+            float max_val = -3e38f;
+            for (int i = 0; i < ALIGN_NUM; ++i) {
+                if (nram_tmp[i] > max_val) {
+                    max_val = nram_tmp[i];
+                }
+            }
+
+            int max_idx = 0;
+            for (int i = 0; i < dim_size; ++i) {
+                if (nram_f[i] == max_val) {
+                    max_idx = i;
+                    break;
+                }
+            }
+
+            result_vals[t] = (half)max_val;
+            result_idx[t] = (int64_t)max_idx;
+
+            nram_f[max_idx] = -3e38f;
+        }
+
+        __memcpy(out_values + (int64_t)b * k,
+                 result_vals,
+                 k * sizeof(half),
+                 NRAM2GDRAM);
+
+        __memcpy(out_indices + (int64_t)b * k,
+                 result_idx,
+                 k * sizeof(int64_t),
+                 NRAM2GDRAM);
+    }
+}
+
+std::vector<torch::Tensor> bang_func(torch::Tensor x, int k, int dim) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
+    TORCH_CHECK(x.dim() == 2, "Input must be 2D [batch, dim]");
+
+    if (dim < 0) dim += x.dim();
+    TORCH_CHECK(dim == 0 || dim == 1, "dim must be 0 or 1");
+
+    bool need_transpose = (dim == 0);
+    auto input_work = need_transpose ? x.transpose(0, 1).contiguous()
+                                     : x.contiguous();
+
+    int batch = static_cast<int>(input_work.size(0));
+    int dim_size = static_cast<int>(input_work.size(1));
+
+    TORCH_CHECK(k > 0 && k <= dim_size, "k must be in (0, dim_size]");
+    TORCH_CHECK(k <= MAX_K, "k exceeds MAX_K");
+    TORCH_CHECK(dim_size <= MAX_DIM, "dim_size exceeds MAX_DIM");
+
+    auto values = torch::empty({batch, k}, input_work.options());
+    auto indices = torch::empty({batch, k}, input_work.options().dtype(torch::kLong));
+
+    uint32_t task_num = 16;
+    if (batch < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(batch);
+    }
+
+    cnrtDim3_t grid_dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    topk_kernel<<<grid_dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(input_work.data_ptr()),
+        reinterpret_cast<half *>(values.data_ptr()),
+        reinterpret_cast<int64_t *>(indices.data_ptr()),
+        batch,
+        dim_size,
+        k);
+
+    return {values, indices};
+}
