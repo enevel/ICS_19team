@@ -1,116 +1,134 @@
 #include <bang.h>
 #include <cnrt.h>
+#include <stdint.h>
 #include <torch/extension.h>
 
-// 基础且安全的分块配置，完美整除官方给定的矩阵维度 (512, 1024, 2048)
-#define BM 64
-#define BK 16
-#define BN 512
+#define TILE_M 32
+#define TILE_K 32
+#define TILE_N 256
 
-// ---------------------------------------------------------
-// BANG C 核函数：高精度向量化 BMM (FP16 进出，FP32 计算)
-// ---------------------------------------------------------
-__mlu_entry__ void basic_bmm_kernel(const half* A, const half* B, half* C,
-                                    int batch, int m, int k, int n) {
-    // 1. FP16 缓冲区：用于和全局内存 (GDRAM) 进行数据交互
-    __nram__ half nram_A_h[BM * BK];
-    __nram__ half nram_B_h[BK * BN];
-    __nram__ half nram_C_h[BM * BN];
+__mlu_entry__ void bmm_kernel(const half *A,
+                              const half *B,
+                              half *C,
+                              int batch,
+                              int m,
+                              int k,
+                              int n) {
+    __nram__ half a_h[TILE_M * TILE_K];
+    __nram__ half b_h[TILE_K * TILE_N];
+    __nram__ half c_h[TILE_M * TILE_N];
+    __nram__ float a_f[TILE_M * TILE_K];
+    __nram__ float b_f[TILE_K * TILE_N];
+    __nram__ float c_f[TILE_M * TILE_N];
+    __nram__ float tmp[TILE_N];
 
-    // 2. FP32 缓冲区：用于核心计算，杜绝 1024 次累加带来的精度截断
-    __nram__ float nram_A[BM * BK];
-    __nram__ float nram_B[BK * BN];
-    __nram__ float nram_C[BM * BN];
-    __nram__ float nram_temp[BN];
+    for (int b_idx = taskId; b_idx < batch; b_idx += taskDim) {
+        const half *A_b = A + (int64_t)b_idx * m * k;
+        const half *B_b = B + (int64_t)b_idx * k * n;
+        half *C_b = C + (int64_t)b_idx * m * n;
 
-    // 多核任务分配
-    for (int b = taskId; b < batch; b += taskDim) {
-        const half* A_b = A + b * m * k;
-        const half* B_b = B + b * k * n;
-        half* C_b = C + b * m * n;
+        for (int i = 0; i < m; i += TILE_M) {
+            int tm = m - i;
+            if (tm > TILE_M) tm = TILE_M;
 
-        // 遍历 C 的每一个输出块
-        for (int i = 0; i < m; i += BM) {
-            for (int j = 0; j < n; j += BN) {
-                
-                // 初始化 FP32 累加器为 0
-                __bang_write_value(nram_C, BM * BN, 0.0f);
+            for (int j = 0; j < n; j += TILE_N) {
+                int tn = n - j;
+                if (tn > TILE_N) tn = TILE_N;
 
-                for (int l = 0; l < k; l += BK) {
-                    
-                    // 【读】将 FP16 数据从全局内存拷贝到 NRAM
-                    for (int r = 0; r < BM; ++r) {
-                        __memcpy(nram_A_h + r * BK, A_b + (i + r) * k + l, BK * sizeof(half), GDRAM2NRAM);
+                __bang_write_value(c_f, TILE_M * TILE_N, 0.0f);
+
+                for (int l = 0; l < k; l += TILE_K) {
+                    int tk = k - l;
+                    if (tk > TILE_K) tk = TILE_K;
+
+                    for (int r = 0; r < tm; ++r) {
+                        __memcpy(a_h + r * TILE_K,
+                                 A_b + (i + r) * k + l,
+                                 tk * sizeof(half), GDRAM2NRAM);
+                        for (int p = tk; p < TILE_K; ++p) {
+                            a_h[r * TILE_K + p] = (half)0.0f;
+                        }
                     }
-                    for (int r = 0; r < BK; ++r) {
-                        __memcpy(nram_B_h + r * BN, B_b + (l + r) * n + j, BN * sizeof(half), GDRAM2NRAM);
+                    for (int r = tm; r < TILE_M; ++r) {
+                        for (int p = 0; p < TILE_K; ++p) {
+                            a_h[r * TILE_K + p] = (half)0.0f;
+                        }
                     }
 
-                    // 【转】瞬间提升精度：FP16 -> FP32
-                    __bang_half2float(nram_A, nram_A_h, BM * BK);
-                    __bang_half2float(nram_B, nram_B_h, BK * BN);
+                    for (int r = 0; r < tk; ++r) {
+                        __memcpy(b_h + r * TILE_N,
+                                 B_b + (l + r) * n + j,
+                                 tn * sizeof(half), GDRAM2NRAM);
+                        for (int p = tn; p < TILE_N; ++p) {
+                            b_h[r * TILE_N + p] = (half)0.0f;
+                        }
+                    }
+                    for (int r = tk; r < TILE_K; ++r) {
+                        for (int p = 0; p < TILE_N; ++p) {
+                            b_h[r * TILE_N + p] = (half)0.0f;
+                        }
+                    }
 
-                    // 【算】使用最基础稳健的向量外积法
-                    for (int kk = 0; kk < BK; ++kk) {
-                        float* B_row = nram_B + kk * BN;
-                        
-                        for (int ii = 0; ii < BM; ++ii) {
-                            float a_val = nram_A[ii * BK + kk];
-                            
-                            // 遇零跳过优化
+                    __bang_half2float(a_f, a_h, TILE_M * TILE_K);
+                    __bang_half2float(b_f, b_h, TILE_K * TILE_N);
+
+                    for (int kk = 0; kk < tk; ++kk) {
+                        float *b_row = b_f + kk * TILE_N;
+                        for (int ii = 0; ii < tm; ++ii) {
+                            float a_val = a_f[ii * TILE_K + kk];
                             if (a_val != 0.0f) {
-                                // 长度 512 的长程向量乘法与累加 (全 FP32)
-                                __bang_mul_scalar(nram_temp, B_row, a_val, BN);
-                                __bang_add(nram_C + ii * BN, nram_C + ii * BN, nram_temp, BN);
+                                __bang_mul_scalar(tmp, b_row, a_val, TILE_N);
+                                __bang_add(c_f + ii * TILE_N,
+                                           c_f + ii * TILE_N, tmp, TILE_N);
                             }
                         }
                     }
                 }
 
-                // 【降】计算完毕，采用就近舍入 (round_nearest) 降维回 FP16
-                __bang_float2half_rn(nram_C_h, nram_C, BM * BN);
-                
-                // 【写】写回全局内存
-                for (int r = 0; r < BM; ++r) {
-                    __memcpy(C_b + (i + r) * n + j, nram_C_h + r * BN, BN * sizeof(half), NRAM2GDRAM);
+                __bang_float2half_rd(c_h, c_f, TILE_M * TILE_N);
+
+                for (int r = 0; r < tm; ++r) {
+                    __memcpy(C_b + (i + r) * n + j,
+                             c_h + r * TILE_N,
+                             tn * sizeof(half), NRAM2GDRAM);
                 }
             }
         }
     }
 }
 
-// ---------------------------------------------------------
-// PyTorch C++ Wrapper
-// ---------------------------------------------------------
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 官方输入确认是 float16，这里做安全检查与内存连续化
-    TORCH_CHECK(A.scalar_type() == torch::kHalf, "Matrix A must be float16");
-    TORCH_CHECK(B.scalar_type() == torch::kHalf, "Matrix B must be float16");
+    TORCH_CHECK(A.scalar_type() == torch::kHalf, "A must be float16");
+    TORCH_CHECK(B.scalar_type() == torch::kHalf, "B must be float16");
+    TORCH_CHECK(A.dim() == 3 && B.dim() == 3, "A and B must be 3D");
 
     auto A_c = A.contiguous();
     auto B_c = B.contiguous();
-    
-    // 初始化输出张量，自动继承输入的设备和数据类型 (float16)
-    auto C = torch::empty({A.size(0), A.size(1), B.size(2)}, A.options());
 
-    int batch = A.size(0);
-    int m = A.size(1);
-    int k = A.size(2);
-    int n = B.size(2);
+    int batch = static_cast<int>(A_c.size(0));
+    int m = static_cast<int>(A_c.size(1));
+    int k = static_cast<int>(A_c.size(2));
+    int n = static_cast<int>(B_c.size(2));
+
+    auto C = torch::empty({batch, m, n}, A_c.options());
+
+    if (batch == 0) {
+        return C;
+    }
 
     uint32_t task_num = 16;
-    if (batch < task_num) task_num = batch;
-    
-    cnrtDim3_t grid_dim = {task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
-    
+    if (batch < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(batch);
+    }
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动稳健版核函数
-    basic_bmm_kernel<<<grid_dim, ktype, queue>>>(
-        reinterpret_cast<const half*>(A_c.data_ptr()),
-        reinterpret_cast<const half*>(B_c.data_ptr()),
-        reinterpret_cast<half*>(C.data_ptr()),
+    bmm_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(A_c.data_ptr()),
+        reinterpret_cast<const half *>(B_c.data_ptr()),
+        reinterpret_cast<half *>(C.data_ptr()),
         batch, m, k, n);
 
     return C;
