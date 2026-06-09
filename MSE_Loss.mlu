@@ -1,0 +1,104 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define ALIGN_NUM 64
+#define MAX_NRAM_SIZE 98304
+
+__mlu_func__ int align_up(int x, int a) {
+    return (x + a - 1) / a * a;
+}
+
+__mlu_entry__ void mse_loss_kernel(const half *predictions,
+                                   const half *targets,
+                                   float *partial_sums,
+                                   int total) {
+    int data_per_task = (total + taskDim - 1) / taskDim;
+    int start = taskId * data_per_task;
+    int end = start + data_per_task;
+    if (end > total) {
+        end = total;
+    }
+    int count = end - start;
+
+    if (count <= 0) {
+        partial_sums[taskId] = 0.0f;
+        return;
+    }
+
+    int max_float = MAX_NRAM_SIZE / sizeof(float);
+    int tile = max_float / 3;
+    tile = (tile / ALIGN_NUM) * ALIGN_NUM;
+
+    __nram__ half nram_pred_h[MAX_NRAM_SIZE / sizeof(half)];
+    __nram__ half nram_tgt_h[MAX_NRAM_SIZE / sizeof(half)];
+    __nram__ float nram_pred[MAX_NRAM_SIZE / sizeof(float)];
+    __nram__ float nram_tgt[MAX_NRAM_SIZE / sizeof(float)];
+    __nram__ float nram_diff[MAX_NRAM_SIZE / sizeof(float)];
+
+    float local_sum = 0.0f;
+    int offset = start;
+    int remain = count;
+
+    while (remain > 0) {
+        int cur = remain > tile ? tile : remain;
+        int pad = align_up(cur, ALIGN_NUM);
+
+        __memcpy(nram_pred_h, predictions + offset, cur * sizeof(half), GDRAM2NRAM);
+        __memcpy(nram_tgt_h, targets + offset, cur * sizeof(half), GDRAM2NRAM);
+
+        for (int i = cur; i < pad; ++i) {
+            nram_pred_h[i] = (half)0.0f;
+            nram_tgt_h[i] = (half)0.0f;
+        }
+
+        __bang_half2float(nram_pred, nram_pred_h, pad);
+        __bang_half2float(nram_tgt, nram_tgt_h, pad);
+
+        __bang_sub(nram_diff, nram_pred, nram_tgt, pad);
+        __bang_mul(nram_diff, nram_diff, nram_diff, pad);
+
+        for (int i = 0; i < cur; ++i) {
+            local_sum += nram_diff[i];
+        }
+
+        offset += cur;
+        remain -= cur;
+    }
+
+    partial_sums[taskId] = local_sum;
+}
+
+torch::Tensor bang_func(torch::Tensor predictions, torch::Tensor targets) {
+    TORCH_CHECK(predictions.scalar_type() == torch::kHalf, "predictions must be float16");
+    TORCH_CHECK(targets.scalar_type() == torch::kHalf, "targets must be float16");
+
+    auto pred_c = predictions.contiguous();
+    auto tgt_c = targets.contiguous();
+    int total = static_cast<int>(pred_c.numel());
+
+    uint32_t task_num = 16;
+    if (total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total);
+    }
+    if (task_num == 0) {
+        return torch::zeros({}, predictions.options().dtype(torch::kFloat32));
+    }
+
+    auto partial = torch::zeros({static_cast<int64_t>(task_num)},
+                                pred_c.options().dtype(torch::kFloat32));
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    mse_loss_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(pred_c.data_ptr()),
+        reinterpret_cast<const half *>(tgt_c.data_ptr()),
+        reinterpret_cast<float *>(partial.data_ptr()),
+        total);
+
+    auto sum = partial.sum();
+    return sum / static_cast<float>(total);
+}
