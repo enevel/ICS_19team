@@ -1,0 +1,90 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define ALIGN_NUM 64
+#define MAX_NRAM_SIZE 98304
+
+__mlu_func__ int align_up(int x, int a) {
+    return (x + a - 1) / a * a;
+}
+
+__mlu_entry__ void sqrt_abs_kernel(const half *input,
+                                   half *output,
+                                   int total) {
+    int data_per_task = (total + taskDim - 1) / taskDim;
+    int start = taskId * data_per_task;
+    int end = start + data_per_task;
+    if (end > total) {
+        end = total;
+    }
+    int count = end - start;
+    if (count <= 0) {
+        return;
+    }
+
+    int max_half = MAX_NRAM_SIZE / sizeof(half);
+    int max_float = MAX_NRAM_SIZE / sizeof(float);
+    int tile = max_float / 2;
+    if (tile > max_half / 2) {
+        tile = max_half / 2;
+    }
+    tile = (tile / ALIGN_NUM) * ALIGN_NUM;
+
+    __nram__ half nram_half[MAX_NRAM_SIZE / sizeof(half)];
+    __nram__ float nram_float[MAX_NRAM_SIZE / sizeof(float)];
+
+    int offset = start;
+    int remain = count;
+
+    while (remain > 0) {
+        int cur = remain > tile ? tile : remain;
+        int pad = align_up(cur, ALIGN_NUM);
+
+        __memcpy(nram_half, input + offset, cur * sizeof(half), GDRAM2NRAM);
+
+        for (int i = cur; i < pad; ++i) {
+            nram_half[i] = (half)0.0f;
+        }
+
+        __bang_half2float(nram_float, nram_half, pad);
+        __bang_abs(nram_float, nram_float, pad);
+        __bang_sqrt(nram_float, nram_float, pad);
+        __bang_float2half_rd(nram_half, nram_float, pad);
+
+        __memcpy(output + offset, nram_half, cur * sizeof(half), NRAM2GDRAM);
+
+        offset += cur;
+        remain -= cur;
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
+
+    auto x_c = x.contiguous();
+    int total = static_cast<int>(x_c.numel());
+
+    auto output = torch::empty_like(x_c);
+
+    if (total == 0) {
+        return output;
+    }
+
+    uint32_t task_num = 16;
+    if (total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total);
+    }
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    sqrt_abs_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x_c.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
+        total);
+
+    return output;
+}
