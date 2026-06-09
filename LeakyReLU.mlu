@@ -3,67 +3,87 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
-#define TILE_ELEMS 32768
-#define TASK_ELEMS (TILE_ELEMS * 16)
+#define ALIGN_NUM 64
+#define TILE_SIZE 16384
+
+__mlu_func__ int align_up(int x, int a) {
+    return (x + a - 1) / a * a;
+}
 
 __mlu_entry__ void leakyrelu_kernel(const half *input,
                                     half *output,
-                                    uint32_t total,
+                                    int total,
                                     float negative_slope) {
-    uint32_t start = taskId * TASK_ELEMS;
-    if (start >= total) {
+    int data_per_task = (total + taskDim - 1) / taskDim;
+    int start = taskId * data_per_task;
+    int end = start + data_per_task;
+    if (end > total) {
+        end = total;
+    }
+    int count = end - start;
+    if (count <= 0) {
         return;
     }
 
-    uint32_t remaining = total - start;
-    uint32_t count = remaining > TASK_ELEMS ? TASK_ELEMS : remaining;
+    __nram__ half nram_in[TILE_SIZE];
+    __nram__ float nram_f[TILE_SIZE];
+    __nram__ float nram_pos[TILE_SIZE];
+    __nram__ float nram_neg[TILE_SIZE];
 
-    __nram__ half nram_input[TILE_ELEMS];
-    __nram__ half nram_relu[TILE_ELEMS];
-    __nram__ half nram_temp[TILE_ELEMS];
+    int offset = start;
+    int remain = count;
 
-    for (uint32_t offset = 0; offset < count; offset += TILE_ELEMS) {
-        uint32_t len = count - offset;
-        if (len > TILE_ELEMS) {
-            len = TILE_ELEMS;
+    while (remain > 0) {
+        int cur = remain > TILE_SIZE ? TILE_SIZE : remain;
+        int pad = align_up(cur, ALIGN_NUM);
+
+        __memcpy(nram_in, input + offset, cur * sizeof(half), GDRAM2NRAM);
+
+        for (int i = cur; i < pad; ++i) {
+            nram_in[i] = (half)0.0f;
         }
 
-        __memcpy(nram_input,
-                 input + start + offset,
-                 len * sizeof(half),
-                 GDRAM2NRAM);
+        __bang_half2float(nram_f, nram_in, pad);
 
-        __bang_active_relu(nram_relu, nram_input, len);
-        __bang_sub(nram_temp, nram_input, nram_relu, len);
-        __bang_mul_scalar(nram_temp, nram_temp, (half)negative_slope, len);
-        __bang_add(nram_temp, nram_relu, nram_temp, len);
+        __bang_active_relu(nram_pos, nram_f, pad);
 
-        __memcpy(output + start + offset,
-                 nram_temp,
-                 len * sizeof(half),
-                 NRAM2GDRAM);
+        __bang_sub(nram_neg, nram_f, nram_pos, pad);
+        __bang_mul_scalar(nram_neg, nram_neg, negative_slope, pad);
+
+        __bang_add(nram_f, nram_pos, nram_neg, pad);
+
+        __bang_float2half_rd(nram_in, nram_f, pad);
+
+        __memcpy(output + offset, nram_in, cur * sizeof(half), NRAM2GDRAM);
+
+        offset += cur;
+        remain -= cur;
     }
 }
 
 torch::Tensor bang_func(torch::Tensor input, double negative_slope) {
-    TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
-    TORCH_CHECK(input.scalar_type() == torch::kHalf, "Input tensor must be float16");
-    TORCH_CHECK(input.numel() <= UINT32_MAX, "Input tensor is too large");
+    TORCH_CHECK(input.scalar_type() == torch::kHalf, "Input must be float16");
 
-    auto output = torch::empty_like(input);
-    uint32_t total = static_cast<uint32_t>(input.numel());
+    auto x_c = input.contiguous();
+    int total = static_cast<int>(x_c.numel());
+
+    auto output = torch::empty_like(x_c);
+
     if (total == 0) {
         return output;
     }
 
-    uint32_t task_num = static_cast<uint32_t>(
-        (static_cast<uint64_t>(total) + TASK_ELEMS - 1) / TASK_ELEMS);
+    uint32_t task_num = 16;
+    if (total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total);
+    }
+
     cnrtDim3_t dim = {task_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     leakyrelu_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<const half *>(input.data_ptr()),
+        reinterpret_cast<const half *>(x_c.data_ptr()),
         reinterpret_cast<half *>(output.data_ptr()),
         total,
         static_cast<float>(negative_slope));
