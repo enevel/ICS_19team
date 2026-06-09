@@ -1,0 +1,105 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <stdint.h>
+#include <torch/extension.h>
+
+#define MAX_HIDDEN 8192
+#define ALIGN_NUM 64
+
+__mlu_func__ int align_up(int x, int a) {
+    return (x + a - 1) / a * a;
+}
+
+__mlu_entry__ void gather_kernel(const half *x,
+                                 const int32_t *indices,
+                                 const half *weights,
+                                 half *output,
+                                 int num_elements,
+                                 int hidden_size,
+                                 int top_k,
+                                 int has_weights) {
+    __nram__ half nram_row[MAX_HIDDEN];
+    __nram__ float nram_f[MAX_HIDDEN];
+
+    int pad_hidden = align_up(hidden_size, ALIGN_NUM);
+
+    for (int i = taskId; i < num_elements; i += taskDim) {
+        int32_t index_a;
+        __memcpy(&index_a, indices + i, sizeof(int32_t), GDRAM2NRAM);
+
+        int32_t src_row = index_a / top_k;
+
+        const half *src_ptr = x + (int64_t)src_row * hidden_size;
+        half *dst_ptr = output + (int64_t)i * hidden_size;
+
+        __memcpy(nram_row, src_ptr, hidden_size * sizeof(half), GDRAM2NRAM);
+
+        if (has_weights) {
+            half w_val;
+            __memcpy(&w_val, weights + i, sizeof(half), GDRAM2NRAM);
+            float w_f = (float)w_val;
+
+            for (int p = hidden_size; p < pad_hidden; ++p) {
+                nram_row[p] = (half)0.0f;
+            }
+
+            __bang_half2float(nram_f, nram_row, pad_hidden);
+            __bang_mul_scalar(nram_f, nram_f, w_f, pad_hidden);
+            __bang_float2half_rd(nram_row, nram_f, pad_hidden);
+        }
+
+        __memcpy(dst_ptr, nram_row, hidden_size * sizeof(half), NRAM2GDRAM);
+    }
+}
+
+torch::Tensor bang_func(torch::Tensor x,
+                        torch::Tensor indices,
+                        torch::Tensor bin_ids,
+                        torch::Tensor weights,
+                        torch::Tensor bins,
+                        int top_k) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
+
+    auto x_c = x.contiguous();
+    auto indices_c = indices.to(torch::kInt32).contiguous();
+
+    int tokens = static_cast<int>(x_c.size(0));
+    int hidden_size = static_cast<int>(x_c.size(1));
+    int num_elements = static_cast<int>(indices_c.size(0));
+
+    TORCH_CHECK(hidden_size <= MAX_HIDDEN, "hidden_size exceeds MAX_HIDDEN");
+
+    int has_weights = (weights.numel() > 0) ? 1 : 0;
+    auto weights_c = has_weights
+                         ? weights.to(torch::kHalf).contiguous()
+                         : torch::empty({0}, x_c.options());
+
+    int out_rows = tokens * top_k;
+    auto output = torch::zeros({out_rows, hidden_size},
+                               x_c.options().dtype(torch::kHalf));
+
+    if (num_elements == 0) {
+        return output;
+    }
+
+    uint32_t task_num = 16;
+    if (num_elements < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(num_elements);
+    }
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    gather_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x_c.data_ptr()),
+        reinterpret_cast<const int32_t *>(indices_c.data_ptr()),
+        reinterpret_cast<const half *>(weights_c.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
+        num_elements,
+        hidden_size,
+        top_k,
+        has_weights);
+
+    return output;
+}
