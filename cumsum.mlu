@@ -1,188 +1,72 @@
 #include <bang.h>
 #include <cnrt.h>
+#include <stdint.h>
 #include <torch/extension.h>
-<<<<<<< HEAD
-#include <math.h>
 
-#define TILE_ELEMS 1024
+__mlu_entry__ void cumsum_kernel(const half *input,
+                                 half *output,
+                                 int outer,
+                                 int dim_size,
+                                 int inner) {
+    __nram__ half nram_val[1];
+    __nram__ half nram_out[1];
 
-__mlu_global__ void cumsum_kernel(const half *x,
-                                  half *y,
-                                  int outer_size,
-                                  int dim_size,
-                                  int inner_size,
-                                  int total_lines) {
-    __nram__ half nram_half[TILE_ELEMS];
-    __nram__ float nram_float[TILE_ELEMS];
+    int total = outer * inner;
 
-    for (int line = taskId; line < total_lines; line += taskDim) {
-        int outer_idx = line / inner_size;
-        int inner_idx = line % inner_size;
-
-        int base = outer_idx * dim_size * inner_size + inner_idx;
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int o = idx / inner;
+        int i = idx % inner;
 
         float running_sum = 0.0f;
 
-        for (int offset = 0; offset < dim_size; offset += TILE_ELEMS) {
-            int len = dim_size - offset;
-            if (len > TILE_ELEMS) {
-                len = TILE_ELEMS;
-            }
-
-            for (int i = 0; i < len; ++i) {
-                int index = base + (offset + i) * inner_size;
-                nram_half[i] = x[index];
-            }
-
-            __bang_half2float(nram_float, nram_half, len);
-
-            for (int i = 0; i < len; ++i) {
-                running_sum += nram_float[i];
-                nram_float[i] = running_sum;
-            }
-
-            __bang_float2half_rn(nram_half, nram_float, len);
-
-            for (int i = 0; i < len; ++i) {
-                int index = base + (offset + i) * inner_size;
-                y[index] = nram_half[i];
-            }
+        for (int d = 0; d < dim_size; ++d) {
+            int64_t pos = ((int64_t)o * dim_size + d) * inner + i;
+            __memcpy(nram_val, input + pos, sizeof(half), GDRAM2NRAM);
+            running_sum += (float)nram_val[0];
+            nram_out[0] = (half)running_sum;
+            __memcpy(output + pos, nram_out, sizeof(half), NRAM2GDRAM);
         }
-=======
-#include <framework/core/MLUStream.h>
-
-#define COLS 4000
-#define PAD_COLS 4096
-#define TASK_NUM 16
-#define ALIGN 64
-
-__mlu_entry__ void cumsum_kernel(const half *x,
-                                 half *y,
-                                 int rows,
-                                 int cols) {
-    __nram__ half nram_h[PAD_COLS];
-    __nram__ float nram_f[PAD_COLS];
-    __nram__ float nram_tmp[PAD_COLS];
-
-    for (int row = taskId; row < rows; row += taskDim) {
-        int base = row * cols;
-
-        __memcpy(nram_h,
-                 x + base,
-                 cols * sizeof(half),
-                 GDRAM2NRAM);
-
-        for (int i = cols; i < PAD_COLS; ++i) {
-            nram_h[i] = (half)0.0f;
-        }
-
-        __bang_half2float(nram_f, nram_h, PAD_COLS);
-
-        for (int step = 1; step < PAD_COLS; step <<= 1) {
-            __memcpy(nram_tmp,
-                     nram_f,
-                     PAD_COLS * sizeof(float),
-                     NRAM2NRAM);
-
-            int len = PAD_COLS - step;
-            int vec_len = (len / ALIGN) * ALIGN;
-
-            if (vec_len > 0) {
-                __bang_add(nram_f + step,
-                           nram_tmp + step,
-                           nram_tmp,
-                           vec_len);
-            }
-
-            for (int i = vec_len; i < len; ++i) {
-                nram_f[step + i] = nram_tmp[step + i] + nram_tmp[i];
-            }
-        }
-
-        __bang_float2half_rn(nram_h, nram_f, PAD_COLS);
-
-        __memcpy(y + base,
-                 nram_h,
-                 cols * sizeof(half),
-                 NRAM2GDRAM);
->>>>>>> 5cf4022cbbc2e4dc0959d018c4990a6882517ce3
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-<<<<<<< HEAD
-    auto x_contiguous = x.contiguous();
-    auto output = torch::empty_like(x_contiguous);
-
-    int ndim = x_contiguous.dim();
-
-    if (dim < 0) {
-        dim += ndim;
-    }
-
-    int outer_size = 1;
-    int dim_size = x_contiguous.size(dim);
-    int inner_size = 1;
-
-    for (int i = 0; i < dim; ++i) {
-        outer_size *= x_contiguous.size(i);
-    }
-
-    for (int i = dim + 1; i < ndim; ++i) {
-        inner_size *= x_contiguous.size(i);
-    }
-
-    int total_lines = outer_size * inner_size;
-
-    int task_num = total_lines;
-    if (task_num > 16) {
-        task_num = 16;
-    }
-
-    cnrtDim3_t k_dim;
-    k_dim.x = task_num;
-    k_dim.y = 1;
-    k_dim.z = 1;
-
-    cnrtFunctionType_t k_type = cnrtFuncTypeBlock;
-
-    cnrtQueue_t queue;
-    cnrtQueueCreate(&queue);
-
-    cumsum_kernel<<<k_dim, k_type, queue>>>(
-        reinterpret_cast<const half *>(x_contiguous.data_ptr()),
-        reinterpret_cast<half *>(output.data_ptr()),
-        outer_size,
-        dim_size,
-        inner_size,
-        total_lines
-    );
-
-    cnrtQueueSync(queue);
-    cnrtQueueDestroy(queue);
-
-    return output;
-}
-=======
     TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
 
     auto x_c = x.contiguous();
-    auto out = torch::empty_like(x_c);
 
-    int rows = x_c.size(0);
-    int cols = x_c.size(1);
+    if (dim < 0) dim += x_c.dim();
+    TORCH_CHECK(dim >= 0 && dim < x_c.dim(), "dim out of range");
 
-    cnrtDim3_t grid_dim = {TASK_NUM, 1, 1};
+    int outer = 1;
+    for (int i = 0; i < dim; ++i) {
+        outer *= static_cast<int>(x_c.size(i));
+    }
+    int dim_size = static_cast<int>(x_c.size(dim));
+    int inner = 1;
+    for (int i = dim + 1; i < x_c.dim(); ++i) {
+        inner *= static_cast<int>(x_c.size(i));
+    }
+
+    auto output = torch::empty_like(x_c);
+
+    int total = outer * inner;
+    if (total == 0) {
+        return output;
+    }
+
+    uint32_t task_num = 16;
+    if (total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total);
+    }
+
+    cnrtDim3_t grid = {task_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    cumsum_kernel<<<grid_dim, ktype, queue>>>(
+    cumsum_kernel<<<grid, ktype, queue>>>(
         reinterpret_cast<const half *>(x_c.data_ptr()),
-        reinterpret_cast<half *>(out.data_ptr()),
-        rows,
-        cols
-    );
+        reinterpret_cast<half *>(output.data_ptr()),
+        outer, dim_size, inner);
 
-    return out;
+    return output;
 }
->>>>>>> 5cf4022cbbc2e4dc0959d018c4990a6882517ce3

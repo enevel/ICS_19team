@@ -27,7 +27,7 @@ __mlu_entry__ void gather_kernel(const half *x,
 
     for (int i = taskId; i < num_elements; i += taskDim) {
         __memcpy(nram_idx, indices + i, sizeof(int32_t), GDRAM2NRAM);
-        int32_t src_row = nram_idx[0] / top_k;
+        int32_t src_row = nram_idx[0];
 
         const half *src_ptr = x + (int64_t)src_row * hidden_size;
         half *dst_ptr = output + (int64_t)i * hidden_size;
@@ -44,7 +44,7 @@ __mlu_entry__ void gather_kernel(const half *x,
 
             __bang_half2float(nram_f, nram_row, pad_hidden);
             __bang_mul_scalar(nram_f, nram_f, w_f, pad_hidden);
-            __bang_float2half_rd(nram_row, nram_f, pad_hidden);
+            __bang_float2half_rn(nram_row, nram_f, pad_hidden);
         }
 
         __memcpy(dst_ptr, nram_row, hidden_size * sizeof(half), NRAM2GDRAM);

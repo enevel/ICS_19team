@@ -1,144 +1,94 @@
 #include <bang.h>
 #include <cnrt.h>
+#include <stdint.h>
 #include <torch/extension.h>
-#include <math.h>
-#include <torch/extension.h>
-#include <torch_mlu/csrc/core/MLUStream.h>
 
-#define TILE_ELEMS 1024
-#define EPS 1e-5f
+#define MAX_SPATIAL 16384
 
-__mlu_global__ void batchnorm_kernel(const half *x,
-                                     half *y,
-                                     int batch,
-                                     int channel,
-                                     int H,
-                                     int W) {
-    int spatial = H * W;
-    int num = batch * spatial;
+__mlu_entry__ void batchnorm_kernel(const half *input,
+                                    half *output,
+                                    int batch,
+                                    int channels,
+                                    int H,
+                                    int W) {
+    __nram__ half nram_h[MAX_SPATIAL];
+    __nram__ float nram_f[MAX_SPATIAL];
 
-    __nram__ half nram_half[TILE_ELEMS];
-    __nram__ float nram_float[TILE_ELEMS];
+    int HW = H * W;
+    int count = batch * HW;
+    float eps = 1e-5f;
 
-    for (int c = taskId; c < channel; c += taskDim) {
+    for (int c = taskId; c < channels; c += taskDim) {
         float sum = 0.0f;
-        float square_sum = 0.0f;
+        for (int b = 0; b < batch; ++b) {
+            const half *ptr = input + ((int64_t)b * channels + c) * HW;
+            __memcpy(nram_h, ptr, HW * sizeof(half), GDRAM2NRAM);
 
-        for (int n = 0; n < batch; ++n) {
-            int base = (n * channel + c) * spatial;
-
-            for (int offset = 0; offset < spatial; offset += TILE_ELEMS) {
-                int len = spatial - offset;
-                if (len > TILE_ELEMS) {
-                    len = TILE_ELEMS;
-                }
-
-                __memcpy(nram_half,
-                         x + base + offset,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-
-                __bang_half2float(nram_float, nram_half, len);
-
-                for (int i = 0; i < len; ++i) {
-                    float v = nram_float[i];
-                    sum += v;
-                    square_sum += v * v;
-                }
+            for (int i = 0; i < HW; ++i) {
+                sum += (float)nram_h[i];
             }
         }
+        float mean = sum / (float)count;
 
-        float mean = sum / num;
-        float var = square_sum / num - mean * mean;
+        float var_sum = 0.0f;
+        for (int b = 0; b < batch; ++b) {
+            const half *ptr = input + ((int64_t)b * channels + c) * HW;
+            __memcpy(nram_h, ptr, HW * sizeof(half), GDRAM2NRAM);
 
-        if (var < 0.0f) {
-            var = 0.0f;
-        }
-
-        float inv_std = 1.0f / sqrtf(var + EPS);
-
-        for (int n = 0; n < batch; ++n) {
-            int base = (n * channel + c) * spatial;
-
-            for (int offset = 0; offset < spatial; offset += TILE_ELEMS) {
-                int len = spatial - offset;
-                if (len > TILE_ELEMS) {
-                    len = TILE_ELEMS;
-                }
-
-                __memcpy(nram_half,
-                         x + base + offset,
-                         len * sizeof(half),
-                         GDRAM2NRAM);
-
-                __bang_half2float(nram_float, nram_half, len);
-
-                for (int i = 0; i < len; ++i) {
-                    nram_float[i] = (nram_float[i] - mean) * inv_std;
-                }
-
-                __bang_float2half_rn(nram_half, nram_float, len);
-
-                __memcpy(y + base + offset,
-                         nram_half,
-                         len * sizeof(half),
-                         NRAM2GDRAM);
+            for (int i = 0; i < HW; ++i) {
+                float diff = (float)nram_h[i] - mean;
+                var_sum += diff * diff;
             }
+        }
+        float var = var_sum / (float)count;
+        float inv_std = 1.0f / sqrtf(var + eps);
+
+        for (int b = 0; b < batch; ++b) {
+            const half *in_ptr = input + ((int64_t)b * channels + c) * HW;
+            half *out_ptr = output + ((int64_t)b * channels + c) * HW;
+
+            __memcpy(nram_h, in_ptr, HW * sizeof(half), GDRAM2NRAM);
+
+            for (int i = 0; i < HW; ++i) {
+                float val = ((float)nram_h[i] - mean) * inv_std;
+                nram_h[i] = (half)val;
+            }
+
+            __memcpy(out_ptr, nram_h, HW * sizeof(half), NRAM2GDRAM);
         }
     }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int num_features) {
-<<<<<<< HEAD
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor must be float16");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
+    TORCH_CHECK(x.dim() == 4, "Input must be 4D [batch, channel, H, W]");
 
     auto x_c = x.contiguous();
+
+    int batch = static_cast<int>(x_c.size(0));
+    int channels = static_cast<int>(x_c.size(1));
+    int H = static_cast<int>(x_c.size(2));
+    int W = static_cast<int>(x_c.size(3));
+
     auto output = torch::empty_like(x_c);
 
-    int batch = x_c.size(0);
-    int channel = x_c.size(1);
-    int H = x_c.size(2);
-    int W = x_c.size(3);
-=======
-    auto x_contiguous = x.contiguous();
-    auto output = torch::empty_like(x_contiguous);
-
-    int batch = x_contiguous.size(0);
-    int channel = x_contiguous.size(1);
-    int H = x_contiguous.size(2);
-    int W = x_contiguous.size(3);
->>>>>>> 5cf4022cbbc2e4dc0959d018c4990a6882517ce3
-
-    int task_num = channel;
-    if (task_num > 16) {
-        task_num = 16;
+    if (channels == 0) {
+        return output;
     }
 
-    cnrtDim3_t dim;
-    dim.x = task_num;
-    dim.y = 1;
-    dim.z = 1;
+    uint32_t task_num = 16;
+    if (channels < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(channels);
+    }
 
+    cnrtDim3_t dim = {task_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-
-    cnrtQueue_t queue;
-    cnrtQueueCreate(&queue);
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
     batchnorm_kernel<<<dim, ktype, queue>>>(
-<<<<<<< HEAD
         reinterpret_cast<const half *>(x_c.data_ptr()),
-=======
-        reinterpret_cast<const half *>(x_contiguous.data_ptr()),
->>>>>>> 5cf4022cbbc2e4dc0959d018c4990a6882517ce3
         reinterpret_cast<half *>(output.data_ptr()),
-        batch,
-        channel,
-        H,
-        W
-    );
-
-    cnrtQueueSync(queue);
-    cnrtQueueDestroy(queue);
+        batch, channels, H, W);
 
     return output;
 }

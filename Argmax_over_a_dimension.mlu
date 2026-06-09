@@ -3,100 +3,82 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
-#define COL_TILE 64
+#define MAX_DIM_SIZE 16384
 
-__mlu_entry__ void argmax_dim1_kernel(const half *input,
-                                      int64_t *output,
-                                      int B,
-                                      int D1,
-                                      int D2,
-                                      int groups) {
-    uint32_t tid = taskId;
+__mlu_entry__ void argmax_kernel(const half *input,
+                                 int64_t *output,
+                                 int outer,
+                                 int dim_size,
+                                 int inner) {
+    __nram__ half nram_val[1];
 
-    uint32_t b = tid / groups;
-    uint32_t g = tid % groups;
+    int total = outer * inner;
 
-    if (b >= (uint32_t)B) {
-        return;
-    }
+    for (int idx = taskId; idx < total; idx += taskDim) {
+        int o = idx / inner;
+        int i = idx % inner;
 
-    uint32_t col_start = g * COL_TILE;
-    if (col_start >= (uint32_t)D2) {
-        return;
-    }
+        const half *base = input + (int64_t)o * dim_size * inner + i;
 
-    uint32_t len = D2 - col_start;
-    if (len > COL_TILE) {
-        len = COL_TILE;
-    }
+        __memcpy(nram_val, base, sizeof(half), GDRAM2NRAM);
+        float max_val = (float)nram_val[0];
+        int64_t max_idx = 0;
 
-    __nram__ half max_vals[COL_TILE];
-    __nram__ half row_vals[COL_TILE];
-    __nram__ int64_t max_idx[COL_TILE];
-
-    const half *base = input + b * D1 * D2;
-
-    __memcpy(max_vals,
-             base + col_start,
-             len * sizeof(half),
-             GDRAM2NRAM);
-
-    for (uint32_t j = 0; j < len; ++j) {
-        max_idx[j] = 0;
-    }
-
-    for (int k = 1; k < D1; ++k) {
-        const half *row_ptr = base + k * D2 + col_start;
-
-        __memcpy(row_vals,
-                 row_ptr,
-                 len * sizeof(half),
-                 GDRAM2NRAM);
-
-        for (uint32_t j = 0; j < len; ++j) {
-            float v = (float)row_vals[j];
-            float cur = (float)max_vals[j];
-
-            if (v > cur) {
-                max_vals[j] = row_vals[j];
-                max_idx[j] = (int64_t)k;
+        for (int d = 1; d < dim_size; ++d) {
+            __memcpy(nram_val, base + (int64_t)d * inner, sizeof(half), GDRAM2NRAM);
+            float v = (float)nram_val[0];
+            if (v > max_val) {
+                max_val = v;
+                max_idx = (int64_t)d;
             }
         }
-    }
 
-    __memcpy(output + b * D2 + col_start,
-             max_idx,
-             len * sizeof(int64_t),
-             NRAM2GDRAM);
+        __nram__ int64_t nram_out_idx[1];
+        nram_out_idx[0] = max_idx;
+        __memcpy(output + idx, nram_out_idx, sizeof(int64_t), NRAM2GDRAM);
+    }
 }
 
 torch::Tensor bang_func(torch::Tensor x, int dim) {
-    TORCH_CHECK(x.is_contiguous(), "Input tensor x must be contiguous");
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor x must be float16");
-    TORCH_CHECK(x.dim() == 3, "Input tensor x must be 3D");
-    TORCH_CHECK(dim == 1, "This implementation only supports dim = 1");
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input must be float16");
 
-    int B = static_cast<int>(x.size(0));
-    int D1 = static_cast<int>(x.size(1));
-    int D2 = static_cast<int>(x.size(2));
+    auto x_c = x.contiguous();
 
-    auto output = torch::empty({B, D2}, x.options().dtype(torch::kLong));
+    if (dim < 0) dim += x_c.dim();
+    TORCH_CHECK(dim >= 0 && dim < x_c.dim(), "dim out of range");
 
-    int groups = (D2 + COL_TILE - 1) / COL_TILE;
-    uint32_t task_num = static_cast<uint32_t>(B * groups);
+    int outer = 1;
+    for (int i = 0; i < dim; ++i) {
+        outer *= static_cast<int>(x_c.size(i));
+    }
+    int dim_size = static_cast<int>(x_c.size(dim));
+    int inner = 1;
+    for (int i = dim + 1; i < x_c.dim(); ++i) {
+        inner *= static_cast<int>(x_c.size(i));
+    }
 
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-    cnrtDim3_t k_dim = {task_num, 1, 1};
+    auto out_sizes = x_c.sizes().vec();
+    out_sizes.erase(out_sizes.begin() + dim);
+    auto output = torch::empty(out_sizes, x_c.options().dtype(torch::kLong));
+
+    int total = outer * inner;
+    if (total == 0) {
+        return output;
+    }
+
+    uint32_t task_num = 16;
+    if (total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total);
+    }
+
+    cnrtDim3_t grid = {task_num, 1, 1};
     cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    argmax_dim1_kernel<<<k_dim, ktype, queue>>>(
-        reinterpret_cast<const half *>(x.data_ptr()),
+    argmax_kernel<<<grid, ktype, queue>>>(
+        reinterpret_cast<const half *>(x_c.data_ptr()),
         reinterpret_cast<int64_t *>(output.data_ptr()),
-        B,
-        D1,
-        D2,
-        groups
-    );
+        outer, dim_size, inner);
 
     return output;
 }

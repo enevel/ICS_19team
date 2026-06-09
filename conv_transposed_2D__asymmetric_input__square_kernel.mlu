@@ -1,72 +1,134 @@
-#include <cmath>
+#include <bang.h>
+#include <cnrt.h>
 #include <stdint.h>
-#include <vector>
 #include <torch/extension.h>
-#include <torch/torch.h>
+
+#define MAX_KW 16
+#define MAX_IC_PER_GROUP 256
+
+__mlu_entry__ void conv_transpose2d_kernel(const half *x,
+                                           const half *weight,
+                                           const half *bias,
+                                           half *output,
+                                           int batch,
+                                           int in_channels,
+                                           int out_channels,
+                                           int h_in,
+                                           int w_in,
+                                           int h_out,
+                                           int w_out,
+                                           int kernel_size,
+                                           int stride,
+                                           int padding,
+                                           int groups,
+                                           int has_bias) {
+    int oc_per_group = out_channels / groups;
+    int ic_per_group = in_channels / groups;
+
+    __nram__ half nram_bias[1];
+
+    int total_tasks = batch * out_channels;
+
+    for (int task = taskId; task < total_tasks; task += taskDim) {
+        int b = task / out_channels;
+        int oc = task % out_channels;
+        int g = oc / oc_per_group;
+        int oc_local = oc % oc_per_group;
+
+        float bias_val = 0.0f;
+        if (has_bias) {
+            __memcpy(nram_bias, bias + oc, sizeof(half), GDRAM2NRAM);
+            bias_val = (float)nram_bias[0];
+        }
+
+        for (int oh = 0; oh < h_out; ++oh) {
+            for (int ow = 0; ow < w_out; ++ow) {
+                float acc = bias_val;
+
+                for (int kh = 0; kh < kernel_size; ++kh) {
+                    int h_tmp = oh + padding - kh;
+                    if (h_tmp < 0 || h_tmp % stride != 0) continue;
+                    int ih = h_tmp / stride;
+                    if (ih >= h_in) continue;
+
+                    for (int kw = 0; kw < kernel_size; ++kw) {
+                        int w_tmp = ow + padding - kw;
+                        if (w_tmp < 0 || w_tmp % stride != 0) continue;
+                        int iw = w_tmp / stride;
+                        if (iw >= w_in) continue;
+
+                        for (int ic_l = 0; ic_l < ic_per_group; ++ic_l) {
+                            int ic = g * ic_per_group + ic_l;
+
+                            int x_idx = ((b * in_channels + ic) * h_in + ih) * w_in + iw;
+                            int w_idx = ((ic * oc_per_group + oc_local) * kernel_size + kh) * kernel_size + kw;
+
+                            float xv = (float)x[x_idx];
+                            float wv = (float)weight[w_idx];
+                            acc += xv * wv;
+                        }
+                    }
+                }
+
+                int o_idx = ((b * out_channels + oc) * h_out + oh) * w_out + ow;
+                output[o_idx] = (half)acc;
+            }
+        }
+    }
+}
 
 torch::Tensor bang_func(torch::Tensor x,
-                        int in_channels,
-                        int out_channels,
-                        int kernel_size,
+                        torch::Tensor weight,
+                        torch::Tensor bias,
                         int stride,
                         int padding,
                         int output_padding,
-                        int groups,
-                        bool bias) {
-    TORCH_CHECK(x.is_contiguous(), "Input tensor x must be contiguous");
-    TORCH_CHECK(x.scalar_type() == torch::kHalf, "Input tensor x must be float16");
-    TORCH_CHECK(in_channels > 0, "in_channels must be positive");
-    TORCH_CHECK(out_channels > 0, "out_channels must be positive");
-    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive");
-    TORCH_CHECK(stride > 0, "stride must be positive");
-    TORCH_CHECK(groups > 0, "groups must be positive");
-    TORCH_CHECK(in_channels % groups == 0, "in_channels must be divisible by groups");
-    TORCH_CHECK(out_channels % groups == 0, "out_channels must be divisible by groups");
+                        int groups) {
+    TORCH_CHECK(x.scalar_type() == torch::kHalf, "x must be float16");
 
-    int out_per_group = out_channels / groups;
-    auto cpu_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    auto x_c = x.contiguous();
+    auto w_c = weight.to(torch::kHalf).contiguous();
 
-    std::vector<int64_t> weight_shape;
-    weight_shape.push_back(in_channels);
-    weight_shape.push_back(out_per_group);
-    weight_shape.push_back(kernel_size);
-    weight_shape.push_back(kernel_size);
+    int batch = static_cast<int>(x_c.size(0));
+    int in_channels = static_cast<int>(x_c.size(1));
+    int h_in = static_cast<int>(x_c.size(2));
+    int w_in = static_cast<int>(x_c.size(3));
+    int oc_per_group = static_cast<int>(w_c.size(1));
+    int kernel_size = static_cast<int>(w_c.size(2));
+    int out_channels = oc_per_group * groups;
 
-    torch::manual_seed(0);
-    auto weight_cpu = torch::empty(weight_shape, cpu_opts);
-    double bound = 1.0 / std::sqrt(static_cast<double>(out_per_group * kernel_size * kernel_size));
-    weight_cpu.uniform_(-bound, bound);
-    auto weight = weight_cpu.to(x.options());
+    int h_out = (h_in - 1) * stride - 2 * padding + kernel_size + output_padding;
+    int w_out = (w_in - 1) * stride - 2 * padding + kernel_size + output_padding;
 
-    c10::optional<torch::Tensor> bias_tensor = c10::nullopt;
-    if (bias) {
-        std::vector<int64_t> bias_shape;
-        bias_shape.push_back(out_channels);
-        auto bias_cpu = torch::empty(bias_shape, cpu_opts);
-        bias_cpu.uniform_(-bound, bound);
-        bias_tensor = bias_cpu.to(x.options());
+    int has_bias = (bias.numel() > 0) ? 1 : 0;
+    auto bias_c = has_bias ? bias.to(torch::kHalf).contiguous()
+                           : torch::empty({0}, x_c.options());
+
+    auto output = torch::zeros({batch, out_channels, h_out, w_out},
+                               x_c.options().dtype(torch::kHalf));
+
+    int total_tasks = batch * out_channels;
+    if (total_tasks == 0) {
+        return output;
     }
 
-    std::vector<int64_t> stride_v;
-    std::vector<int64_t> padding_v;
-    std::vector<int64_t> output_padding_v;
-    std::vector<int64_t> dilation_v;
-    stride_v.push_back(stride);
-    stride_v.push_back(stride);
-    padding_v.push_back(padding);
-    padding_v.push_back(padding);
-    output_padding_v.push_back(output_padding);
-    output_padding_v.push_back(output_padding);
-    dilation_v.push_back(1);
-    dilation_v.push_back(1);
+    uint32_t task_num = 16;
+    if (total_tasks < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total_tasks);
+    }
 
-    return torch::conv_transpose2d(
-        x,
-        weight,
-        bias_tensor,
-        stride_v,
-        padding_v,
-        output_padding_v,
-        groups,
-        dilation_v);
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    conv_transpose2d_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(x_c.data_ptr()),
+        reinterpret_cast<const half *>(w_c.data_ptr()),
+        reinterpret_cast<const half *>(bias_c.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
+        batch, in_channels, out_channels,
+        h_in, w_in, h_out, w_out,
+        kernel_size, stride, padding, groups, has_bias);
+
+    return output;
 }

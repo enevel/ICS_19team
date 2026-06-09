@@ -1,106 +1,86 @@
 #include <bang.h>
 #include <cnrt.h>
+#include <stdint.h>
 #include <torch/extension.h>
 
-// 极限分块：16384。完美整除 K=131072。
-// 3 个 FP32 数组总计占用约 192KB NRAM，极度安全，拉满单次计算吞吐量
-#define BK 16384
+#define ALIGN_NUM 64
+#define MAX_K 16384
 
-// ---------------------------------------------------------
-// BANG C 原生核函数：纯血 FP32 高精度 GEMV 引擎
-// ---------------------------------------------------------
-__mlu_entry__ void gemv_float_kernel(const float* A, const float* B, float* C, int M, int K) {
-    // 1. NRAM 缓冲区 (全量使用 FP32 杜绝任何截断误差)
-    __nram__ float nram_A[BK];
-    __nram__ float nram_B[BK];
-    __nram__ float nram_temp[BK];
-
-    // 2. 当前核心负责的行输出累加器
-    // 16 核分发 256 行，单核最多只处理 16 行。开辟 256 绝对充足。
-    __nram__ float nram_row_sums[256];
-
-    // 计算当前核的任务区间 [row_start, row_end)
-    int rows_per_core = (M + taskDim - 1) / taskDim;
-    int row_start = taskId * rows_per_core;
-    int row_end = row_start + rows_per_core;
-    if (row_end > M) row_end = M;
-    int actual_rows = row_end - row_start;
-
-    if (actual_rows <= 0) return;
-
-    // 清零累加器
-    for (int i = 0; i < actual_rows; i++) {
-        nram_row_sums[i] = 0.0f;
-    }
-
-    // 3. 核心计算逻辑：K 维度切分
-    for (int k_idx = 0; k_idx < K; k_idx += BK) {
-        int current_bk = (K - k_idx) > BK ? BK : (K - k_idx);
-
-        // 🚀 核心优化：高频缓存复用
-        // 向量 B 缓存在 NRAM 中，被该核心负责的所有 16 行共享！访存压力骤降！
-        __memcpy(nram_B, B + k_idx, current_bk * sizeof(float), GDRAM2NRAM);
-
-        // 遍历当前核负责的矩阵 A 的每一行
-        for (int r = 0; r < actual_rows; r++) {
-            int global_row = row_start + r;
-
-            // 载入 A 的片段
-            __memcpy(nram_A, A + global_row * K + k_idx, current_bk * sizeof(float), GDRAM2NRAM);
-
-            // FP32 向量按位乘法
-            __bang_mul(nram_temp, nram_A, nram_B, current_bk);
-
-            // 🚀 核心优化：二叉树向量规约 (Binary Tree Reduction)
-            // 使用向量 ALU 折叠数组，取代极慢的标量 for 循环
-            int span = current_bk / 2;
-            while (span >= 64) {
-                __bang_add(nram_temp, nram_temp, nram_temp + span, span);
-                span /= 2;
-            }
-
-            // 最后 64 个元素用标量累加扫尾 (已经是最优解)
-            float chunk_sum = 0.0f;
-            for (int s = 0; s < 64; s++) {
-                chunk_sum += nram_temp[s];
-            }
-
-            // 累加进当前行
-            nram_row_sums[r] += chunk_sum;
-        }
-    }
-
-    // 4. 将高精度结果直接写回全局内存
-    __memcpy(C + row_start, nram_row_sums, actual_rows * sizeof(float), NRAM2GDRAM);
+__mlu_func__ int align_up(int x, int a) {
+    return (x + a - 1) / a * a;
 }
 
-// ---------------------------------------------------------
-// PyTorch C++ Wrapper 接口：动态适配数据类型
-// ---------------------------------------------------------
+__mlu_entry__ void gemv_kernel(const half *A,
+                               const half *B,
+                               half *output,
+                               int M,
+                               int K) {
+    __nram__ half nram_a[MAX_K];
+    __nram__ half nram_b[MAX_K];
+    __nram__ float nram_af[MAX_K];
+    __nram__ float nram_bf[MAX_K];
+    __nram__ float nram_prod[MAX_K];
+    __nram__ half nram_out[1];
+
+    int pad_k = align_up(K, ALIGN_NUM);
+
+    __memcpy(nram_b, B, K * sizeof(half), GDRAM2NRAM);
+    __bang_write_value(nram_b + K, pad_k - K, (half)0.0f);
+    __bang_half2float(nram_bf, nram_b, pad_k);
+
+    for (int m = taskId; m < M; m += taskDim) {
+        __memcpy(nram_a, A + (int64_t)m * K, K * sizeof(half), GDRAM2NRAM);
+        __bang_write_value(nram_a + K, pad_k - K, (half)0.0f);
+
+        __bang_half2float(nram_af, nram_a, pad_k);
+        __bang_mul(nram_prod, nram_af, nram_bf, pad_k);
+
+        for (int step = pad_k / 2; step >= ALIGN_NUM; step /= 2) {
+            __bang_add(nram_prod, nram_prod, nram_prod + step, step);
+        }
+
+        float sum = 0.0f;
+        for (int i = 0; i < ALIGN_NUM; ++i) {
+            sum += nram_prod[i];
+        }
+
+        nram_out[0] = (half)sum;
+        __memcpy(output + m, nram_out, sizeof(half), NRAM2GDRAM);
+    }
+}
+
 torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
-    // 🌟 核心修复：尊重 Python 传下来的真实精度，不再强转 FP16
-    auto A_f = A.to(torch::kFloat32).contiguous();
-    auto B_f = B.to(torch::kFloat32).contiguous();
+    TORCH_CHECK(A.scalar_type() == torch::kHalf, "A must be float16");
+    TORCH_CHECK(B.scalar_type() == torch::kHalf, "B must be float16");
 
-    int M = A.size(0);
-    int K = A.size(1);
+    auto A_c = A.contiguous();
+    auto B_c = B.contiguous();
 
-    // 输出同样在 FP32 下创建，接住核函数的完美精度结果
-    auto C_f = torch::empty({M, 1}, A.options().dtype(torch::kFloat32));
+    int M = static_cast<int>(A_c.size(0));
+    int K = static_cast<int>(A_c.size(1));
+
+    TORCH_CHECK(K <= MAX_K, "K exceeds MAX_K");
+
+    auto output = torch::empty({M, 1}, A_c.options());
+
+    if (M == 0) {
+        return output;
+    }
 
     uint32_t task_num = 16;
-    cnrtDim3_t grid_dim = {task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock; 
+    if (M < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(M);
+    }
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    // 启动纯血版浮点 GEMV 引擎
-    gemv_float_kernel<<<grid_dim, ktype, queue>>>(
-        reinterpret_cast<const float*>(A_f.data_ptr()),
-        reinterpret_cast<const float*>(B_f.data_ptr()),
-        reinterpret_cast<float*>(C_f.data_ptr()),
-        M, K
-    );
+    gemv_kernel<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(A_c.data_ptr()),
+        reinterpret_cast<const half *>(B_c.data_ptr()),
+        reinterpret_cast<half *>(output.data_ptr()),
+        M, K);
 
-    // 动态返回：原系统给的什么类型，我们就返回什么类型
-    return C_f.to(A.dtype());
+    return output;
 }
