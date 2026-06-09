@@ -20,14 +20,14 @@ __mlu_entry__ void gather_kernel(const half *x,
                                  int has_weights) {
     __nram__ half nram_row[MAX_HIDDEN];
     __nram__ float nram_f[MAX_HIDDEN];
+    __nram__ int32_t nram_idx[1];
+    __nram__ half nram_w[1];
 
     int pad_hidden = align_up(hidden_size, ALIGN_NUM);
 
     for (int i = taskId; i < num_elements; i += taskDim) {
-        int32_t index_a;
-        __memcpy(&index_a, indices + i, sizeof(int32_t), GDRAM2NRAM);
-
-        int32_t src_row = index_a / top_k;
+        __memcpy(nram_idx, indices + i, sizeof(int32_t), GDRAM2NRAM);
+        int32_t src_row = nram_idx[0] / top_k;
 
         const half *src_ptr = x + (int64_t)src_row * hidden_size;
         half *dst_ptr = output + (int64_t)i * hidden_size;
@@ -35,9 +35,8 @@ __mlu_entry__ void gather_kernel(const half *x,
         __memcpy(nram_row, src_ptr, hidden_size * sizeof(half), GDRAM2NRAM);
 
         if (has_weights) {
-            half w_val;
-            __memcpy(&w_val, weights + i, sizeof(half), GDRAM2NRAM);
-            float w_f = (float)w_val;
+            __memcpy(nram_w, weights + i, sizeof(half), GDRAM2NRAM);
+            float w_f = (float)nram_w[0];
 
             for (int p = hidden_size; p < pad_hidden; ++p) {
                 nram_row[p] = (half)0.0f;
