@@ -3,36 +3,32 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
-#define MAX_K 2048
+#define TILE_K 1024
 #define TILE_N 512
+#define ALIGN_NUM 64
+
+__mlu_func__ int align_up(int x, int a) {
+    return (x + a - 1) / a * a;
+}
 
 __mlu_entry__ void bmm_kernel(const half *A,
                               const half *B,
-                              half *C,
+                              float *C,
                               int batch,
                               int m,
                               int k,
                               int n) {
-    __nram__ half nram_a_h[MAX_K];
-    __nram__ float nram_a_f[MAX_K];
+    __nram__ half nram_a_h[TILE_K];
     __nram__ half nram_b_h[TILE_N];
-    __nram__ float nram_b_f[TILE_N];
     __nram__ float nram_c_f[TILE_N];
-    __nram__ half nram_c_h[TILE_N];
+    __nram__ float nram_out_f[TILE_N];
 
     for (int b_idx = taskId; b_idx < batch; b_idx += taskDim) {
         const half *A_b = A + (int64_t)b_idx * m * k;
         const half *B_b = B + (int64_t)b_idx * k * n;
-        half *C_b = C + (int64_t)b_idx * m * n;
+        float *C_b = C + (int64_t)b_idx * m * n;
 
         for (int i = 0; i < m; ++i) {
-            __memcpy(nram_a_h, A_b + (int64_t)i * k,
-                     k * sizeof(half), GDRAM2NRAM);
-
-            int pad_k = (k + 63) / 64 * 64;
-            __bang_write_value(nram_a_h + k, pad_k - k, (half)0.0f);
-            __bang_half2float(nram_a_f, nram_a_h, pad_k);
-
             for (int j = 0; j < n; j += TILE_N) {
                 int tn = n - j;
                 if (tn > TILE_N) tn = TILE_N;
@@ -41,24 +37,28 @@ __mlu_entry__ void bmm_kernel(const half *A,
                     nram_c_f[t] = 0.0f;
                 }
 
-                for (int l = 0; l < k; ++l) {
-                    float a_val = nram_a_f[l];
-                    if (a_val == 0.0f) continue;
+                for (int lk = 0; lk < k; lk += TILE_K) {
+                    int tk = k - lk;
+                    if (tk > TILE_K) tk = TILE_K;
 
-                    __memcpy(nram_b_h, B_b + (int64_t)l * n + j,
-                             tn * sizeof(half), GDRAM2NRAM);
+                    __memcpy(nram_a_h, A_b + (int64_t)i * k + lk,
+                             tk * sizeof(half), GDRAM2NRAM);
 
-                    for (int t = 0; t < tn; ++t) {
-                        nram_c_f[t] += a_val * (float)nram_b_h[t];
+                    for (int l = 0; l < tk; ++l) {
+                        float a_val = (float)nram_a_h[l];
+                        if (a_val == 0.0f) continue;
+
+                        __memcpy(nram_b_h, B_b + (int64_t)(lk + l) * n + j,
+                                 tn * sizeof(half), GDRAM2NRAM);
+
+                        for (int t = 0; t < tn; ++t) {
+                            nram_c_f[t] += a_val * (float)nram_b_h[t];
+                        }
                     }
                 }
 
-                for (int t = 0; t < tn; ++t) {
-                    nram_c_h[t] = (half)nram_c_f[t];
-                }
-
-                __memcpy(C_b + (int64_t)i * n + j, nram_c_h,
-                         tn * sizeof(half), NRAM2GDRAM);
+                __memcpy(C_b + (int64_t)i * n + j, nram_c_f,
+                         tn * sizeof(float), NRAM2GDRAM);
             }
         }
     }
@@ -77,7 +77,8 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     int k = static_cast<int>(A_c.size(2));
     int n = static_cast<int>(B_c.size(2));
 
-    auto C = torch::empty({batch, m, n}, A_c.options());
+    auto C = torch::empty({batch, m, n},
+                          A_c.options().dtype(torch::kFloat32));
 
     if (batch == 0) {
         return C;
@@ -95,7 +96,7 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
     bmm_kernel<<<dim, ktype, queue>>>(
         reinterpret_cast<const half *>(A_c.data_ptr()),
         reinterpret_cast<const half *>(B_c.data_ptr()),
-        reinterpret_cast<half *>(C.data_ptr()),
+        reinterpret_cast<float *>(C.data_ptr()),
         batch, m, k, n);
 
     return C;
