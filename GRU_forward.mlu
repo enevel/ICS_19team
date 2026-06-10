@@ -1,97 +1,62 @@
-#include <bang.h>
-#include <cnrt.h>
 #include <torch/extension.h>
-#include <torch_mlu/csrc/aten/utils/Utils.h>
-#include <math.h>
+#include <vector>
 
-#define CHECK_MLU(x) TORCH_CHECK(x.is_mlu(), #x " must be an MLU tensor")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
-#define CHECK_HALF(x) TORCH_CHECK(x.scalar_type() == torch::kFloat16, #x " must be float16")
+torch::Tensor gru_single_layer_forward(
+    torch::Tensor input_seq,
+    torch::Tensor weight_ih,
+    torch::Tensor weight_hh,
+    torch::Tensor bias_ih,
+    torch::Tensor bias_hh,
+    int hidden_size) {
 
-__mlu_entry__ void zero_half_kernel(half *ptr, int total) {
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        ptr[idx] = (half)0.0f;
+    int64_t batch = input_seq.size(0);
+    int64_t seq_len = input_seq.size(1);
+    int64_t input_size = input_seq.size(2);
+
+    auto opts = input_seq.options();
+
+    torch::Tensor h = torch::zeros({batch, hidden_size}, opts);
+
+    std::vector<torch::Tensor> outputs;
+    outputs.reserve(seq_len);
+
+    auto weight_ih_t = weight_ih.transpose(0, 1).contiguous();
+    auto weight_hh_t = weight_hh.transpose(0, 1).contiguous();
+
+    // 一次性计算所有时间步的 input gate:
+    // input_seq: [B, T, I]
+    // weight_ih_t: [I, 3H]
+    // gi_all: [B, T, 3H]
+    auto input_2d = input_seq.reshape({batch * seq_len, input_size});
+    auto gi_all = torch::matmul(input_2d, weight_ih_t)
+                      .reshape({batch, seq_len, 3 * hidden_size});
+
+    gi_all = gi_all + bias_ih.reshape({1, 1, 3 * hidden_size});
+
+    for (int64_t t = 0; t < seq_len; ++t) {
+        auto gi = gi_all.select(1, t);
+
+        auto gh = torch::matmul(h, weight_hh_t) +
+                  bias_hh.reshape({1, 3 * hidden_size});
+
+        auto i_r = gi.slice(1, 0, hidden_size);
+        auto i_z = gi.slice(1, hidden_size, 2 * hidden_size);
+        auto i_n = gi.slice(1, 2 * hidden_size, 3 * hidden_size);
+
+        auto h_r = gh.slice(1, 0, hidden_size);
+        auto h_z = gh.slice(1, hidden_size, 2 * hidden_size);
+        auto h_n = gh.slice(1, 2 * hidden_size, 3 * hidden_size);
+
+        auto r = torch::sigmoid(i_r + h_r);
+        auto z = torch::sigmoid(i_z + h_z);
+        auto n = torch::tanh(i_n + r * h_n);
+
+        h = (1 - z) * n + z * h;
+
+        outputs.push_back(h.unsqueeze(1));
     }
-}
 
-__mlu_entry__ void gru_layer_step_kernel_fp16(
-    const half *input,
-    const half *h_prev,
-    const half *weight_ih,
-    const half *weight_hh,
-    const half *bias_ih,
-    const half *bias_hh,
-    half *h_next,
-    half *output,
-    int batch,
-    int seq_len,
-    int time_index,
-    int input_size,
-    int hidden_size,
-    int input_is_sequence,
-    int output_is_sequence) {
-
-    int total = batch * hidden_size;
-
-    for (int linear = taskId; linear < total; linear += taskDim) {
-        int b = linear / hidden_size;
-        int h = linear - b * hidden_size;
-
-        const half *x_t;
-        if (input_is_sequence) {
-            x_t = input + ((b * seq_len + time_index) * input_size);
-        } else {
-            x_t = input + b * input_size;
-        }
-
-        const half *h_t_prev = h_prev + b * hidden_size;
-
-        float gate_r = (float)bias_ih[h] + (float)bias_hh[h];
-        float gate_z = (float)bias_ih[hidden_size + h] +
-                       (float)bias_hh[hidden_size + h];
-
-        float gate_n_in = (float)bias_ih[2 * hidden_size + h];
-        float gate_n_hidden = (float)bias_hh[2 * hidden_size + h];
-
-        const half *w_ir = weight_ih + h * input_size;
-        const half *w_iz = weight_ih + (hidden_size + h) * input_size;
-        const half *w_in = weight_ih + (2 * hidden_size + h) * input_size;
-
-        for (int i = 0; i < input_size; ++i) {
-            float xv = (float)x_t[i];
-            gate_r += (float)w_ir[i] * xv;
-            gate_z += (float)w_iz[i] * xv;
-            gate_n_in += (float)w_in[i] * xv;
-        }
-
-        const half *w_hr = weight_hh + h * hidden_size;
-        const half *w_hz = weight_hh + (hidden_size + h) * hidden_size;
-        const half *w_hn = weight_hh + (2 * hidden_size + h) * hidden_size;
-
-        for (int i = 0; i < hidden_size; ++i) {
-            float hp = (float)h_t_prev[i];
-            gate_r += (float)w_hr[i] * hp;
-            gate_z += (float)w_hz[i] * hp;
-            gate_n_hidden += (float)w_hn[i] * hp;
-        }
-
-        float r = 1.0f / (1.0f + expf(-gate_r));
-        float z = 1.0f / (1.0f + expf(-gate_z));
-
-        float n_arg = gate_n_in + r * gate_n_hidden;
-        float n = tanhf(n_arg);
-
-        float prev_h = (float)h_t_prev[h];
-        float next_h = (1.0f - z) * n + z * prev_h;
-
-        h_next[b * hidden_size + h] = (half)next_h;
-
-        if (output_is_sequence) {
-            output[(b * seq_len + time_index) * hidden_size + h] = (half)next_h;
-        } else {
-            output[b * hidden_size + h] = (half)next_h;
-        }
-    }
+    return torch::cat(outputs, 1);
 }
 
 torch::Tensor bang_func(
@@ -108,40 +73,15 @@ torch::Tensor bang_func(
     int hidden_size,
     int num_layers) {
 
-    CHECK_MLU(x);
-    CHECK_MLU(weight_ih_l0);
-    CHECK_MLU(weight_hh_l0);
-    CHECK_MLU(bias_ih_l0);
-    CHECK_MLU(bias_hh_l0);
-    CHECK_MLU(weight_ih_l1);
-    CHECK_MLU(weight_hh_l1);
-    CHECK_MLU(bias_ih_l1);
-    CHECK_MLU(bias_hh_l1);
-
-    CHECK_HALF(x);
-    CHECK_HALF(weight_ih_l0);
-    CHECK_HALF(weight_hh_l0);
-    CHECK_HALF(bias_ih_l0);
-    CHECK_HALF(bias_hh_l0);
-    CHECK_HALF(weight_ih_l1);
-    CHECK_HALF(weight_hh_l1);
-    CHECK_HALF(bias_ih_l1);
-    CHECK_HALF(bias_hh_l1);
-
     TORCH_CHECK(x.dim() == 3, "x must be [batch, seq_len, input_size]");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat16, "x must be float16");
     TORCH_CHECK(num_layers == 2, "This implementation supports num_layers == 2");
 
-    int batch = x.size(0);
-    int seq_len = x.size(1);
-    int x_input_size = x.size(2);
+    int64_t batch = x.size(0);
+    int64_t seq_len = x.size(1);
 
-    TORCH_CHECK(x_input_size == input_size,
+    TORCH_CHECK(x.size(2) == input_size,
                 "input_size does not match x.size(2)");
-
-    TORCH_CHECK(weight_ih_l0.dim() == 2, "weight_ih_l0 must be 2D");
-    TORCH_CHECK(weight_hh_l0.dim() == 2, "weight_hh_l0 must be 2D");
-    TORCH_CHECK(weight_ih_l1.dim() == 2, "weight_ih_l1 must be 2D");
-    TORCH_CHECK(weight_hh_l1.dim() == 2, "weight_hh_l1 must be 2D");
 
     TORCH_CHECK(weight_ih_l0.size(0) == 3 * hidden_size &&
                 weight_ih_l0.size(1) == input_size,
@@ -169,6 +109,7 @@ torch::Tensor bang_func(
                 "bias_hh_l1 must be [3 * hidden_size]");
 
     auto x_c = x.contiguous();
+
     auto wih0 = weight_ih_l0.contiguous();
     auto whh0 = weight_hh_l0.contiguous();
     auto bih0 = bias_ih_l0.contiguous();
@@ -179,76 +120,21 @@ torch::Tensor bang_func(
     auto bih1 = bias_ih_l1.contiguous();
     auto bhh1 = bias_hh_l1.contiguous();
 
-    auto opts = x.options().dtype(torch::kFloat16);
+    auto layer0_out = gru_single_layer_forward(
+        x_c,
+        wih0,
+        whh0,
+        bih0,
+        bhh0,
+        hidden_size);
 
-    auto h0_prev = torch::empty({batch, hidden_size}, opts);
-    auto h0_next = torch::empty({batch, hidden_size}, opts);
-    auto h1_prev = torch::empty({batch, hidden_size}, opts);
-    auto h1_next = torch::empty({batch, hidden_size}, opts);
+    auto layer1_out = gru_single_layer_forward(
+        layer0_out,
+        wih1,
+        whh1,
+        bih1,
+        bhh1,
+        hidden_size);
 
-    auto output = torch::empty({batch, seq_len, hidden_size}, opts);
-
-    cnrtDim3_t dim;
-    dim.x = 64;
-    dim.y = 1;
-    dim.z = 1;
-
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    int hidden_total = batch * hidden_size;
-
-    zero_half_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half *>(h0_prev.data_ptr()),
-        hidden_total);
-
-    zero_half_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<half *>(h1_prev.data_ptr()),
-        hidden_total);
-
-    for (int t = 0; t < seq_len; ++t) {
-        gru_layer_step_kernel_fp16<<<dim, ktype, queue>>>(
-            reinterpret_cast<const half *>(x_c.data_ptr()),
-            reinterpret_cast<const half *>(h0_prev.data_ptr()),
-            reinterpret_cast<const half *>(wih0.data_ptr()),
-            reinterpret_cast<const half *>(whh0.data_ptr()),
-            reinterpret_cast<const half *>(bih0.data_ptr()),
-            reinterpret_cast<const half *>(bhh0.data_ptr()),
-            reinterpret_cast<half *>(h0_next.data_ptr()),
-            reinterpret_cast<half *>(h0_next.data_ptr()),
-            batch,
-            seq_len,
-            t,
-            input_size,
-            hidden_size,
-            1,
-            0);
-
-        gru_layer_step_kernel_fp16<<<dim, ktype, queue>>>(
-            reinterpret_cast<const half *>(h0_next.data_ptr()),
-            reinterpret_cast<const half *>(h1_prev.data_ptr()),
-            reinterpret_cast<const half *>(wih1.data_ptr()),
-            reinterpret_cast<const half *>(whh1.data_ptr()),
-            reinterpret_cast<const half *>(bih1.data_ptr()),
-            reinterpret_cast<const half *>(bhh1.data_ptr()),
-            reinterpret_cast<half *>(h1_next.data_ptr()),
-            reinterpret_cast<half *>(output.data_ptr()),
-            batch,
-            seq_len,
-            t,
-            hidden_size,
-            hidden_size,
-            0,
-            1);
-
-        auto tmp0 = h0_prev;
-        h0_prev = h0_next;
-        h0_next = tmp0;
-
-        auto tmp1 = h1_prev;
-        h1_prev = h1_next;
-        h1_next = tmp1;
-    }
-
-    return output;
+    return layer1_out;
 }
