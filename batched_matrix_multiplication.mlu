@@ -3,8 +3,7 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
-#define TILE_M 64
-#define TILE_K 16
+#define MAX_K 2048
 #define TILE_N 512
 
 __mlu_entry__ void bmm_kernel(const half *A,
@@ -14,70 +13,52 @@ __mlu_entry__ void bmm_kernel(const half *A,
                               int m,
                               int k,
                               int n) {
-    __nram__ half a_h[TILE_M * TILE_K];
-    __nram__ half b_h[TILE_K * TILE_N];
-    __nram__ half c_h[TILE_M * TILE_N];
-    __nram__ float a_f[TILE_M * TILE_K];
-    __nram__ float b_f[TILE_K * TILE_N];
-    __nram__ float c_f[TILE_M * TILE_N];
-    __nram__ float tmp[TILE_N];
+    __nram__ half nram_a_h[MAX_K];
+    __nram__ float nram_a_f[MAX_K];
+    __nram__ half nram_b_h[TILE_N];
+    __nram__ float nram_b_f[TILE_N];
+    __nram__ float nram_c_f[TILE_N];
+    __nram__ half nram_c_h[TILE_N];
 
     for (int b_idx = taskId; b_idx < batch; b_idx += taskDim) {
         const half *A_b = A + (int64_t)b_idx * m * k;
         const half *B_b = B + (int64_t)b_idx * k * n;
         half *C_b = C + (int64_t)b_idx * m * n;
 
-        for (int i = 0; i < m; i += TILE_M) {
-            int tm = m - i;
-            if (tm > TILE_M) tm = TILE_M;
+        for (int i = 0; i < m; ++i) {
+            __memcpy(nram_a_h, A_b + (int64_t)i * k,
+                     k * sizeof(half), GDRAM2NRAM);
+
+            int pad_k = (k + 63) / 64 * 64;
+            __bang_write_value(nram_a_h + k, pad_k - k, (half)0.0f);
+            __bang_half2float(nram_a_f, nram_a_h, pad_k);
 
             for (int j = 0; j < n; j += TILE_N) {
                 int tn = n - j;
                 if (tn > TILE_N) tn = TILE_N;
 
-                __bang_write_value(c_f, TILE_M * TILE_N, 0.0f);
+                for (int t = 0; t < tn; ++t) {
+                    nram_c_f[t] = 0.0f;
+                }
 
-                for (int l = 0; l < k; l += TILE_K) {
-                    int tk = k - l;
-                    if (tk > TILE_K) tk = TILE_K;
+                for (int l = 0; l < k; ++l) {
+                    float a_val = nram_a_f[l];
+                    if (a_val == 0.0f) continue;
 
-                    __bang_write_value(a_h, TILE_M * TILE_K, (half)0.0f);
-                    for (int r = 0; r < tm; ++r) {
-                        __memcpy(a_h + r * TILE_K,
-                                 A_b + (i + r) * k + l,
-                                 tk * sizeof(half), GDRAM2NRAM);
-                    }
+                    __memcpy(nram_b_h, B_b + (int64_t)l * n + j,
+                             tn * sizeof(half), GDRAM2NRAM);
 
-                    __bang_write_value(b_h, TILE_K * TILE_N, (half)0.0f);
-                    for (int r = 0; r < tk; ++r) {
-                        __memcpy(b_h + r * TILE_N,
-                                 B_b + (l + r) * n + j,
-                                 tn * sizeof(half), GDRAM2NRAM);
-                    }
-
-                    __bang_half2float(a_f, a_h, TILE_M * TILE_K);
-                    __bang_half2float(b_f, b_h, TILE_K * TILE_N);
-
-                    for (int kk = 0; kk < tk; ++kk) {
-                        float *b_row = b_f + kk * TILE_N;
-                        for (int ii = 0; ii < tm; ++ii) {
-                            float a_val = a_f[ii * TILE_K + kk];
-                            if (a_val != 0.0f) {
-                                __bang_mul_scalar(tmp, b_row, a_val, TILE_N);
-                                __bang_add(c_f + ii * TILE_N,
-                                           c_f + ii * TILE_N, tmp, TILE_N);
-                            }
-                        }
+                    for (int t = 0; t < tn; ++t) {
+                        nram_c_f[t] += a_val * (float)nram_b_h[t];
                     }
                 }
 
-                __bang_float2half_rn(c_h, c_f, TILE_M * TILE_N);
-
-                for (int r = 0; r < tm; ++r) {
-                    __memcpy(C_b + (i + r) * n + j,
-                             c_h + r * TILE_N,
-                             tn * sizeof(half), NRAM2GDRAM);
+                for (int t = 0; t < tn; ++t) {
+                    nram_c_h[t] = (half)nram_c_f[t];
                 }
+
+                __memcpy(C_b + (int64_t)i * n + j, nram_c_h,
+                         tn * sizeof(half), NRAM2GDRAM);
             }
         }
     }
