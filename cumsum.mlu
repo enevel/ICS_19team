@@ -11,14 +11,14 @@ __mlu_func__ int align_up(int x, int a) {
 }
 
 __mlu_entry__ void cumsum_kernel(const half *input,
-                                 half *output,
+                                 float *output,
                                  int outer,
                                  int dim_size,
                                  int inner) {
     __nram__ half nram_h[MAX_DIM];
     __nram__ float nram_f[MAX_DIM];
+    __nram__ float nram_val_f[1];
     __nram__ half nram_val[1];
-    __nram__ half nram_out[1];
 
     if (inner == 1 && dim_size <= MAX_DIM) {
         int pad_dim = align_up(dim_size, ALIGN_NUM);
@@ -36,10 +36,8 @@ __mlu_entry__ void cumsum_kernel(const half *input,
                 nram_f[d] = running_sum;
             }
 
-            __bang_float2half_rn(nram_h, nram_f, pad_dim);
-
-            __memcpy(output + (int64_t)o * dim_size, nram_h,
-                     dim_size * sizeof(half), NRAM2GDRAM);
+            __memcpy(output + (int64_t)o * dim_size, nram_f,
+                     dim_size * sizeof(float), NRAM2GDRAM);
         }
     } else {
         int total = outer * inner;
@@ -48,16 +46,16 @@ __mlu_entry__ void cumsum_kernel(const half *input,
             int i = idx % inner;
 
             const half *base_in = input + (int64_t)o * dim_size * inner + i;
-            half *base_out = output + (int64_t)o * dim_size * inner + i;
+            float *base_out = output + (int64_t)o * dim_size * inner + i;
 
             float running_sum = 0.0f;
             for (int d = 0; d < dim_size; ++d) {
                 __memcpy(nram_val, base_in + (int64_t)d * inner,
                          sizeof(half), GDRAM2NRAM);
                 running_sum += (float)nram_val[0];
-                nram_out[0] = (half)running_sum;
-                __memcpy(base_out + (int64_t)d * inner, nram_out,
-                         sizeof(half), NRAM2GDRAM);
+                nram_val_f[0] = running_sum;
+                __memcpy(base_out + (int64_t)d * inner, nram_val_f,
+                         sizeof(float), NRAM2GDRAM);
             }
         }
     }
@@ -81,7 +79,8 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
         inner *= static_cast<int>(x_c.size(i));
     }
 
-    auto output = torch::empty_like(x_c);
+    auto output = torch::empty(x_c.sizes().vec(),
+                               x_c.options().dtype(torch::kFloat32));
 
     int total = outer * inner;
     if (total == 0) {
@@ -99,7 +98,7 @@ torch::Tensor bang_func(torch::Tensor x, int dim) {
 
     cumsum_kernel<<<grid, ktype, queue>>>(
         reinterpret_cast<const half *>(x_c.data_ptr()),
-        reinterpret_cast<half *>(output.data_ptr()),
+        reinterpret_cast<float *>(output.data_ptr()),
         outer, dim_size, inner);
 
     return output;
