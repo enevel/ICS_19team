@@ -3,6 +3,10 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
+#define MAX_INPUT_HW 32768
+#define MAX_OUTPUT_HW 32768
+#define MAX_KS2 256
+
 __mlu_entry__ void conv_transpose2d_kernel(const half *x,
                                            const half *weight,
                                            half *output,
@@ -19,10 +23,14 @@ __mlu_entry__ void conv_transpose2d_kernel(const half *x,
                                            int stride,
                                            int padding,
                                            int groups) {
-    __nram__ half nram_x[1];
-    __nram__ half nram_w[1];
-    __nram__ half nram_out[1];
+    __nram__ half nram_x[MAX_INPUT_HW];
+    __nram__ half nram_w[MAX_KS2];
+    __nram__ float nram_acc[MAX_OUTPUT_HW];
+    __nram__ half nram_out_h[MAX_OUTPUT_HW];
 
+    int hw_in = h_in * w_in;
+    int hw_out = h_out * w_out;
+    int ks2 = kernel_size * kernel_size;
     int total_tasks = batch * out_channels;
 
     for (int task = taskId; task < total_tasks; task += taskDim) {
@@ -31,41 +39,47 @@ __mlu_entry__ void conv_transpose2d_kernel(const half *x,
         int g = oc / oc_per_group;
         int oc_local = oc % oc_per_group;
 
-        for (int oh = 0; oh < h_out; ++oh) {
-            for (int ow = 0; ow < w_out; ++ow) {
-                float acc = 0.0f;
+        for (int p = 0; p < hw_out; ++p) {
+            nram_acc[p] = 0.0f;
+        }
 
-                for (int kh = 0; kh < kernel_size; ++kh) {
-                    int h_tmp = oh + padding - kh;
-                    if (h_tmp < 0 || h_tmp % stride != 0) continue;
-                    int ih = h_tmp / stride;
-                    if (ih >= h_in) continue;
+        for (int ic_l = 0; ic_l < ic_per_group; ++ic_l) {
+            int ic = g * ic_per_group + ic_l;
 
-                    for (int kw = 0; kw < kernel_size; ++kw) {
-                        int w_tmp = ow + padding - kw;
-                        if (w_tmp < 0 || w_tmp % stride != 0) continue;
-                        int iw = w_tmp / stride;
-                        if (iw >= w_in) continue;
+            __memcpy(nram_x,
+                     x + ((int64_t)b * in_channels + ic) * hw_in,
+                     hw_in * sizeof(half), GDRAM2NRAM);
 
-                        for (int ic_l = 0; ic_l < ic_per_group; ++ic_l) {
-                            int ic = g * ic_per_group + ic_l;
+            __memcpy(nram_w,
+                     weight + ((int64_t)ic * oc_per_group + oc_local) * ks2,
+                     ks2 * sizeof(half), GDRAM2NRAM);
 
-                            int x_idx = ((b * in_channels + ic) * h_in + ih) * w_in + iw;
-                            int w_idx = ((ic * oc_per_group + oc_local) * kernel_size + kh) * kernel_size + kw;
+            for (int ih = 0; ih < h_in; ++ih) {
+                for (int iw = 0; iw < w_in; ++iw) {
+                    float x_val = (float)nram_x[ih * w_in + iw];
+                    if (x_val == 0.0f) continue;
 
-                            __memcpy(nram_x, x + x_idx, sizeof(half), GDRAM2NRAM);
-                            __memcpy(nram_w, weight + w_idx, sizeof(half), GDRAM2NRAM);
+                    for (int kh = 0; kh < kernel_size; ++kh) {
+                        int oh = ih * stride - padding + kh;
+                        if (oh < 0 || oh >= h_out) continue;
 
-                            acc += (float)nram_x[0] * (float)nram_w[0];
+                        for (int kw = 0; kw < kernel_size; ++kw) {
+                            int ow = iw * stride - padding + kw;
+                            if (ow < 0 || ow >= w_out) continue;
+
+                            float w_val = (float)nram_w[kh * kernel_size + kw];
+                            nram_acc[oh * w_out + ow] += x_val * w_val;
                         }
                     }
                 }
-
-                int o_idx = ((b * out_channels + oc) * h_out + oh) * w_out + ow;
-                nram_out[0] = (half)acc;
-                __memcpy(output + o_idx, nram_out, sizeof(half), NRAM2GDRAM);
             }
         }
+
+        half *dst = output + ((int64_t)b * out_channels + oc) * hw_out;
+        for (int p = 0; p < hw_out; ++p) {
+            nram_out_h[p] = (half)nram_acc[p];
+        }
+        __memcpy(dst, nram_out_h, hw_out * sizeof(half), NRAM2GDRAM);
     }
 }
 
