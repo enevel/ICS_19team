@@ -3,8 +3,8 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
+#define TILE_K 8192
 #define ALIGN_NUM 64
-#define MAX_K 16384
 
 __mlu_func__ int align_up(int x, int a) {
     return (x + a - 1) / a * a;
@@ -15,36 +15,47 @@ __mlu_entry__ void gemv_kernel(const half *A,
                                half *output,
                                int M,
                                int K) {
-    __nram__ half nram_a[MAX_K];
-    __nram__ half nram_b[MAX_K];
-    __nram__ float nram_af[MAX_K];
-    __nram__ float nram_bf[MAX_K];
-    __nram__ float nram_prod[MAX_K];
+    __nram__ half nram_a[TILE_K];
+    __nram__ half nram_b[TILE_K];
+    __nram__ float nram_af[TILE_K];
+    __nram__ float nram_bf[TILE_K];
+    __nram__ float nram_prod[TILE_K];
     __nram__ half nram_out[1];
 
-    int pad_k = align_up(K, ALIGN_NUM);
-
-    __memcpy(nram_b, B, K * sizeof(half), GDRAM2NRAM);
-    __bang_write_value(nram_b + K, pad_k - K, (half)0.0f);
-    __bang_half2float(nram_bf, nram_b, pad_k);
-
     for (int m = taskId; m < M; m += taskDim) {
-        __memcpy(nram_a, A + (int64_t)m * K, K * sizeof(half), GDRAM2NRAM);
-        __bang_write_value(nram_a + K, pad_k - K, (half)0.0f);
+        float total_sum = 0.0f;
 
-        __bang_half2float(nram_af, nram_a, pad_k);
-        __bang_mul(nram_prod, nram_af, nram_bf, pad_k);
+        for (int kk = 0; kk < K; kk += TILE_K) {
+            int tk = K - kk;
+            if (tk > TILE_K) tk = TILE_K;
+            int pad_tk = align_up(tk, ALIGN_NUM);
 
-        for (int step = pad_k / 2; step >= ALIGN_NUM; step /= 2) {
-            __bang_add(nram_prod, nram_prod, nram_prod + step, step);
+            __memcpy(nram_a, A + (int64_t)m * K + kk,
+                     tk * sizeof(half), GDRAM2NRAM);
+            __memcpy(nram_b, B + kk,
+                     tk * sizeof(half), GDRAM2NRAM);
+
+            if (tk < pad_tk) {
+                __bang_write_value(nram_a + tk, pad_tk - tk, (half)0.0f);
+                __bang_write_value(nram_b + tk, pad_tk - tk, (half)0.0f);
+            }
+
+            __bang_half2float(nram_af, nram_a, pad_tk);
+            __bang_half2float(nram_bf, nram_b, pad_tk);
+            __bang_mul(nram_prod, nram_af, nram_bf, pad_tk);
+
+            for (int step = pad_tk / 2; step >= ALIGN_NUM; step /= 2) {
+                __bang_add(nram_prod, nram_prod, nram_prod + step, step);
+            }
+
+            float tile_sum = 0.0f;
+            for (int i = 0; i < ALIGN_NUM; ++i) {
+                tile_sum += nram_prod[i];
+            }
+            total_sum += tile_sum;
         }
 
-        float sum = 0.0f;
-        for (int i = 0; i < ALIGN_NUM; ++i) {
-            sum += nram_prod[i];
-        }
-
-        nram_out[0] = (half)sum;
+        nram_out[0] = (half)total_sum;
         __memcpy(output + m, nram_out, sizeof(half), NRAM2GDRAM);
     }
 }
@@ -58,8 +69,6 @@ torch::Tensor bang_func(torch::Tensor A, torch::Tensor B) {
 
     int M = static_cast<int>(A_c.size(0));
     int K = static_cast<int>(A_c.size(1));
-
-    TORCH_CHECK(K <= MAX_K, "K exceeds MAX_K");
 
     auto output = torch::empty({M, 1}, A_c.options());
 
