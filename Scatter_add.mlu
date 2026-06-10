@@ -9,49 +9,52 @@ __mlu_entry__ void zero_half_kernel(half *out, int total) {
     }
 }
 
-__mlu_entry__ void scatter_add_forward_i64_kernel(const half *src,
-                                                  const int64_t *index,
-                                                  half *out,
-                                                  int N,
-                                                  int D,
-                                                  int dim_size) {
-    // 每个 task 负责若干列 d
-    // 对每一列，按 n 从小到大执行：
-    // out[index[n], d] += src[n, d]
-    for (int d = taskId; d < D; d += taskDim) {
-        for (int n = 0; n < N; ++n) {
-            int64_t row = index[n];
+__mlu_entry__ void scatter_add_atomic_i64_kernel(const half *src,
+                                                 const int64_t *index,
+                                                 half *out,
+                                                 int total,
+                                                 int N,
+                                                 int D,
+                                                 int dim_size) {
+    for (int linear = taskId; linear < total; linear += taskDim) {
+        int n = linear / D;
+        int d = linear - n * D;
 
-            if (row >= 0 && row < dim_size) {
-                int out_offset = (int)row * D + d;
-                int src_offset = n * D + d;
+        int64_t row = index[n];
 
-                // 这里用 float 做一次加法，然后写回 half
-                // 输出仍然是 float16
-                float v = (float)out[out_offset] + (float)src[src_offset];
-                out[out_offset] = (half)v;
-            }
+        if (row >= 0 && row < dim_size) {
+            int out_offset = (int)row * D + d;
+            int src_offset = n * D + d;
+
+            half old_val;
+            __bang_atomic_add(&old_val,
+                              out + out_offset,
+                              src[src_offset]);
         }
     }
 }
 
-__mlu_entry__ void scatter_add_forward_i32_kernel(const half *src,
-                                                  const int32_t *index,
-                                                  half *out,
-                                                  int N,
-                                                  int D,
-                                                  int dim_size) {
-    for (int d = taskId; d < D; d += taskDim) {
-        for (int n = 0; n < N; ++n) {
-            int32_t row = index[n];
+__mlu_entry__ void scatter_add_atomic_i32_kernel(const half *src,
+                                                 const int32_t *index,
+                                                 half *out,
+                                                 int total,
+                                                 int N,
+                                                 int D,
+                                                 int dim_size) {
+    for (int linear = taskId; linear < total; linear += taskDim) {
+        int n = linear / D;
+        int d = linear - n * D;
 
-            if (row >= 0 && row < dim_size) {
-                int out_offset = row * D + d;
-                int src_offset = n * D + d;
+        int32_t row = index[n];
 
-                float v = (float)out[out_offset] + (float)src[src_offset];
-                out[out_offset] = (half)v;
-            }
+        if (row >= 0 && row < dim_size) {
+            int out_offset = row * D + d;
+            int src_offset = n * D + d;
+
+            half old_val;
+            __bang_atomic_add(&old_val,
+                              out + out_offset,
+                              src[src_offset]);
         }
     }
 }
@@ -75,44 +78,53 @@ torch::Tensor bang_func(torch::Tensor src,
 
     int N = static_cast<int>(src_c.size(0));
     int D = static_cast<int>(src_c.size(1));
+    int out_total = dim_size * D;
+    int src_total = N * D;
 
     auto out = torch::empty({dim_size, D},
                             src_c.options().dtype(torch::kFloat16));
 
-    int total = dim_size * D;
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    uint32_t task_num = 64;
-    if (D > 0 && D < static_cast<int>(task_num)) {
-        task_num = static_cast<uint32_t>(D);
+    uint32_t task_num = 256;
+
+    if (out_total > 0 && out_total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(out_total);
     }
+
+    if (src_total > out_total && src_total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(src_total);
+    }
+
     if (task_num == 0) {
         task_num = 1;
     }
 
     cnrtDim3_t dim = {task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
 
-    if (total > 0) {
+    if (out_total > 0) {
         zero_half_kernel<<<dim, ktype, queue>>>(
             reinterpret_cast<half *>(out.data_ptr()),
-            total);
+            out_total);
     }
 
-    if (N > 0 && D > 0 && dim_size > 0) {
+    if (src_total > 0 && dim_size > 0) {
         if (index_c.scalar_type() == torch::kInt64) {
-            scatter_add_forward_i64_kernel<<<dim, ktype, queue>>>(
+            scatter_add_atomic_i64_kernel<<<dim, ktype, queue>>>(
                 reinterpret_cast<const half *>(src_c.data_ptr()),
                 reinterpret_cast<const int64_t *>(index_c.data_ptr()),
                 reinterpret_cast<half *>(out.data_ptr()),
+                src_total,
                 N,
                 D,
                 dim_size);
         } else {
-            scatter_add_forward_i32_kernel<<<dim, ktype, queue>>>(
+            scatter_add_atomic_i32_kernel<<<dim, ktype, queue>>>(
                 reinterpret_cast<const half *>(src_c.data_ptr()),
                 reinterpret_cast<const int32_t *>(index_c.data_ptr()),
                 reinterpret_cast<half *>(out.data_ptr()),
+                src_total,
                 N,
                 D,
                 dim_size);
