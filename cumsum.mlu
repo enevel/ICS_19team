@@ -20,16 +20,23 @@ __mlu_entry__ void cumsum_kernel(const half *input,
     __nram__ half nram_val[1];
     __nram__ half nram_out[1];
 
-    if (inner == 1) {
+    if (inner == 1 && dim_size <= MAX_DIM) {
+        int pad_dim = align_up(dim_size, ALIGN_NUM);
+
         for (int o = taskId; o < outer; o += taskDim) {
             __memcpy(nram_h, input + (int64_t)o * dim_size,
                      dim_size * sizeof(half), GDRAM2NRAM);
 
+            __bang_write_value(nram_h + dim_size, pad_dim - dim_size, (half)0.0f);
+            __bang_half2float(nram_f, nram_h, pad_dim);
+
             float running_sum = 0.0f;
             for (int d = 0; d < dim_size; ++d) {
-                running_sum += (float)nram_h[d];
-                nram_h[d] = (half)running_sum;
+                running_sum += nram_f[d];
+                nram_f[d] = running_sum;
             }
+
+            __bang_float2half_rn(nram_h, nram_f, pad_dim);
 
             __memcpy(output + (int64_t)o * dim_size, nram_h,
                      dim_size * sizeof(half), NRAM2GDRAM);
