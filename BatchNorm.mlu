@@ -1,20 +1,19 @@
 #include <bang.h>
 #include <cnrt.h>
 #include <stdint.h>
+#include <math.h>
 #include <torch/extension.h>
 
-#define MAX_SPATIAL 16384
+#define TILE_HW 4096
 
 __mlu_entry__ void batchnorm_kernel(const half *input,
                                     half *output,
                                     int batch,
                                     int channels,
-                                    int H,
-                                    int W) {
-    __nram__ half nram_h[MAX_SPATIAL];
-    __nram__ float nram_f[MAX_SPATIAL];
+                                    int HW) {
+    __nram__ half nram_h[TILE_HW];
+    __nram__ half nram_out_h[1];
 
-    int HW = H * W;
     int count = batch * HW;
     float eps = 1e-5f;
 
@@ -22,10 +21,16 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
         float sum = 0.0f;
         for (int b = 0; b < batch; ++b) {
             const half *ptr = input + ((int64_t)b * channels + c) * HW;
-            __memcpy(nram_h, ptr, HW * sizeof(half), GDRAM2NRAM);
-
-            for (int i = 0; i < HW; ++i) {
-                sum += (float)nram_h[i];
+            int remain = HW;
+            int offset = 0;
+            while (remain > 0) {
+                int cur = remain > TILE_HW ? TILE_HW : remain;
+                __memcpy(nram_h, ptr + offset, cur * sizeof(half), GDRAM2NRAM);
+                for (int i = 0; i < cur; ++i) {
+                    sum += (float)nram_h[i];
+                }
+                offset += cur;
+                remain -= cur;
             }
         }
         float mean = sum / (float)count;
@@ -33,11 +38,17 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
         float var_sum = 0.0f;
         for (int b = 0; b < batch; ++b) {
             const half *ptr = input + ((int64_t)b * channels + c) * HW;
-            __memcpy(nram_h, ptr, HW * sizeof(half), GDRAM2NRAM);
-
-            for (int i = 0; i < HW; ++i) {
-                float diff = (float)nram_h[i] - mean;
-                var_sum += diff * diff;
+            int remain = HW;
+            int offset = 0;
+            while (remain > 0) {
+                int cur = remain > TILE_HW ? TILE_HW : remain;
+                __memcpy(nram_h, ptr + offset, cur * sizeof(half), GDRAM2NRAM);
+                for (int i = 0; i < cur; ++i) {
+                    float diff = (float)nram_h[i] - mean;
+                    var_sum += diff * diff;
+                }
+                offset += cur;
+                remain -= cur;
             }
         }
         float var = var_sum / (float)count;
@@ -46,15 +57,19 @@ __mlu_entry__ void batchnorm_kernel(const half *input,
         for (int b = 0; b < batch; ++b) {
             const half *in_ptr = input + ((int64_t)b * channels + c) * HW;
             half *out_ptr = output + ((int64_t)b * channels + c) * HW;
-
-            __memcpy(nram_h, in_ptr, HW * sizeof(half), GDRAM2NRAM);
-
-            for (int i = 0; i < HW; ++i) {
-                float val = ((float)nram_h[i] - mean) * inv_std;
-                nram_h[i] = (half)val;
+            int remain = HW;
+            int offset = 0;
+            while (remain > 0) {
+                int cur = remain > TILE_HW ? TILE_HW : remain;
+                __memcpy(nram_h, in_ptr + offset, cur * sizeof(half), GDRAM2NRAM);
+                for (int i = 0; i < cur; ++i) {
+                    float val = ((float)nram_h[i] - mean) * inv_std;
+                    nram_h[i] = (half)val;
+                }
+                __memcpy(out_ptr + offset, nram_h, cur * sizeof(half), NRAM2GDRAM);
+                offset += cur;
+                remain -= cur;
             }
-
-            __memcpy(out_ptr, nram_h, HW * sizeof(half), NRAM2GDRAM);
         }
     }
 }
@@ -69,6 +84,7 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     int channels = static_cast<int>(x_c.size(1));
     int H = static_cast<int>(x_c.size(2));
     int W = static_cast<int>(x_c.size(3));
+    int HW = H * W;
 
     auto output = torch::empty_like(x_c);
 
@@ -88,7 +104,7 @@ torch::Tensor bang_func(torch::Tensor x, int num_features) {
     batchnorm_kernel<<<dim, ktype, queue>>>(
         reinterpret_cast<const half *>(x_c.data_ptr()),
         reinterpret_cast<half *>(output.data_ptr()),
-        batch, channels, H, W);
+        batch, channels, HW);
 
     return output;
 }
