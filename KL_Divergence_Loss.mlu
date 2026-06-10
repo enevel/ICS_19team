@@ -1,71 +1,31 @@
-#include <bang.h>
-#include <cnrt.h>
-#include <math.h>
-#include <stdint.h>
 #include <torch/extension.h>
 
-#define KL_BATCH 128
-#define KL_NUM_CLASSES 1024
-
-__mlu_entry__ void kl_partial_kernel(const float *input_log_prob,
-                                     const float *target_prob,
-                                     float *partial,
-                                     int total) {
-    int chunk = (total + taskDim - 1) / taskDim;
-    int start = taskId * chunk;
-    int end = start + chunk;
-    if (end > total) {
-        end = total;
-    }
-
-    float sum = 0.0f;
-    for (int i = start; i < end; ++i) {
-        float target = target_prob[i];
-        sum += target * (logf(target) - input_log_prob[i]);
-    }
-
-    partial[taskId] = sum;
-}
-
-__mlu_entry__ void kl_final_kernel(const float *partial, float *out, int partial_count) {
-    float sum = 0.0f;
-    for (int i = 0; i < partial_count; ++i) {
-        sum += partial[i];
-    }
-    out[0] = sum / static_cast<float>(KL_BATCH);
-}
-
 torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
-    auto input_c = input_log_prob.to(torch::kFloat32).contiguous();
-    auto target_c = target_prob.to(torch::kFloat32).contiguous();
+    TORCH_CHECK(input_log_prob.dim() == 2, "input_log_prob must be 2D");
+    TORCH_CHECK(target_prob.dim() == 2, "target_prob must be 2D");
+    TORCH_CHECK(input_log_prob.sizes() == target_prob.sizes(),
+                "input_log_prob and target_prob must have same shape");
+    TORCH_CHECK(input_log_prob.scalar_type() == torch::kFloat16,
+                "input_log_prob must be float16");
+    TORCH_CHECK(target_prob.scalar_type() == torch::kFloat16,
+                "target_prob must be float16");
 
-    TORCH_CHECK(input_c.dim() == 2, "input_log_prob must be 2D");
-    TORCH_CHECK(target_c.sizes() == input_c.sizes(), "target_prob shape mismatch");
+    int64_t batch = input_log_prob.size(0);
 
-    int batch = static_cast<int>(input_c.size(0));
-    int num_classes = static_cast<int>(input_c.size(1));
-    int total = batch * num_classes;
+    auto input = input_log_prob.contiguous();
+    auto target = target_prob.contiguous();
 
-    uint32_t task_num = 16;
-    auto partial = torch::empty({static_cast<int64_t>(task_num)},
-                                input_c.options().dtype(torch::kFloat32));
-    auto out = torch::empty({}, input_c.options().dtype(torch::kFloat32));
+    auto zero = torch::zeros_like(target);
 
-    cnrtDim3_t dim = {task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+    // target == 0 时 KL 项按 0 处理，避免 0 * log(0) 产生 NaN
+    auto kl_terms = torch::where(
+        target > 0,
+        target * (torch::log(target) - input),
+        zero
+    );
 
-    kl_partial_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<const float *>(input_c.data_ptr()),
-        reinterpret_cast<const float *>(target_c.data_ptr()),
-        reinterpret_cast<float *>(partial.data_ptr()),
-        total);
-
-    cnrtDim3_t one = {1, 1, 1};
-    kl_final_kernel<<<one, ktype, queue>>>(
-        reinterpret_cast<const float *>(partial.data_ptr()),
-        reinterpret_cast<float *>(out.data_ptr()),
-        static_cast<int>(task_num));
+    // batchmean: sum over all elements / batch
+    auto out = kl_terms.sum() / batch;
 
     return out;
 }

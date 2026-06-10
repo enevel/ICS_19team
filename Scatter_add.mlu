@@ -1,62 +1,29 @@
-#include <bang.h>
-#include <cnrt.h>
-#include <stdint.h>
 #include <torch/extension.h>
 
-#define SCATTER_D 256
-
-__mlu_entry__ void scatter_add_kernel(const float *src,
-                                      const int64_t *index,
-                                      float *out,
-                                      int N,
-                                      int D,
-                                      int dim_size) {
-    __nram__ float sum[SCATTER_D];
-    __nram__ float row[SCATTER_D];
-
-    for (int out_row = taskId; out_row < dim_size; out_row += taskDim) {
-        __bang_write_value(sum, SCATTER_D, 0.0f);
-
-        for (int n = 0; n < N; ++n) {
-            if (index[n] == out_row) {
-                __memcpy(row, src + n * D, D * sizeof(float), GDRAM2NRAM);
-                __bang_add(sum, sum, row, D);
-            }
-        }
-
-        __memcpy(out + out_row * D, sum, D * sizeof(float), NRAM2GDRAM);
-    }
-}
-
 torch::Tensor bang_func(torch::Tensor src, torch::Tensor index, int dim_size) {
-    auto src_c = src.to(torch::kFloat32).contiguous();
+    TORCH_CHECK(src.dim() == 2, "src must be 2D, shape [N, D]");
+    TORCH_CHECK(index.dim() == 1, "index must be 1D, shape [N]");
+    TORCH_CHECK(index.size(0) == src.size(0),
+                "index length must match src.size(0)");
+    TORCH_CHECK(src.scalar_type() == torch::kFloat16,
+                "src must be float16");
+    TORCH_CHECK(index.scalar_type() == torch::kInt64 ||
+                index.scalar_type() == torch::kInt32,
+                "index must be int64 or int32");
+    TORCH_CHECK(dim_size >= 0, "dim_size must be non-negative");
+
+    int64_t N = src.size(0);
+    int64_t D = src.size(1);
+
+    auto src_c = src.contiguous();
     auto index_c = index.to(torch::kInt64).contiguous();
 
-    TORCH_CHECK(src_c.dim() == 2, "src must be 2D");
-    TORCH_CHECK(index_c.dim() == 1, "index must be 1D");
-    TORCH_CHECK(index_c.size(0) == src_c.size(0), "index length mismatch");
-    TORCH_CHECK(src_c.size(1) <= SCATTER_D, "This implementation expects D <= 256");
+    auto out = torch::zeros({dim_size, D}, src.options());
 
-    int N = static_cast<int>(src_c.size(0));
-    int D = static_cast<int>(src_c.size(1));
-    auto out = torch::empty({dim_size, D}, src_c.options().dtype(torch::kFloat32));
-
-    uint32_t task_num = 16;
-    if (dim_size < static_cast<int>(task_num)) {
-        task_num = static_cast<uint32_t>(dim_size);
-    }
-
-    cnrtDim3_t dim = {task_num, 1, 1};
-    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
-    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
-
-    scatter_add_kernel<<<dim, ktype, queue>>>(
-        reinterpret_cast<const float *>(src_c.data_ptr()),
-        reinterpret_cast<const int64_t *>(index_c.data_ptr()),
-        reinterpret_cast<float *>(out.data_ptr()),
-        N,
-        D,
-        dim_size);
+    // 等价于：
+    // for n in range(N):
+    //     out[index[n], :] += src[n, :]
+    out.index_add_(0, index_c, src_c);
 
     return out;
 }
