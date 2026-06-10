@@ -4,11 +4,6 @@
 #include <torch/extension.h>
 
 #define TILE_K 8192
-#define ALIGN_NUM 64
-
-__mlu_func__ int align_up(int x, int a) {
-    return (x + a - 1) / a * a;
-}
 
 __mlu_entry__ void gemv_kernel(const half *A,
                                const half *B,
@@ -17,9 +12,6 @@ __mlu_entry__ void gemv_kernel(const half *A,
                                int K) {
     __nram__ half nram_a[TILE_K];
     __nram__ half nram_b[TILE_K];
-    __nram__ float nram_af[TILE_K];
-    __nram__ float nram_bf[TILE_K];
-    __nram__ float nram_prod[TILE_K];
     __nram__ half nram_out[1];
 
     for (int m = taskId; m < M; m += taskDim) {
@@ -28,31 +20,15 @@ __mlu_entry__ void gemv_kernel(const half *A,
         for (int kk = 0; kk < K; kk += TILE_K) {
             int tk = K - kk;
             if (tk > TILE_K) tk = TILE_K;
-            int pad_tk = align_up(tk, ALIGN_NUM);
 
             __memcpy(nram_a, A + (int64_t)m * K + kk,
                      tk * sizeof(half), GDRAM2NRAM);
             __memcpy(nram_b, B + kk,
                      tk * sizeof(half), GDRAM2NRAM);
 
-            if (tk < pad_tk) {
-                __bang_write_value(nram_a + tk, pad_tk - tk, (half)0.0f);
-                __bang_write_value(nram_b + tk, pad_tk - tk, (half)0.0f);
+            for (int i = 0; i < tk; ++i) {
+                total_sum += (float)nram_a[i] * (float)nram_b[i];
             }
-
-            __bang_half2float(nram_af, nram_a, pad_tk);
-            __bang_half2float(nram_bf, nram_b, pad_tk);
-            __bang_mul(nram_prod, nram_af, nram_bf, pad_tk);
-
-            for (int step = pad_tk / 2; step >= ALIGN_NUM; step /= 2) {
-                __bang_add(nram_prod, nram_prod, nram_prod + step, step);
-            }
-
-            float tile_sum = 0.0f;
-            for (int i = 0; i < ALIGN_NUM; ++i) {
-                tile_sum += nram_prod[i];
-            }
-            total_sum += tile_sum;
         }
 
         nram_out[0] = (half)total_sum;
