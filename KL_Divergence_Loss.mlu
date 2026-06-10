@@ -1,8 +1,56 @@
+#include <bang.h>
+#include <cnrt.h>
+#include <math.h>
+#include <stdint.h>
 #include <torch/extension.h>
 
-torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob) {
-    TORCH_CHECK(input_log_prob.dim() == 2, "input_log_prob must be 2D");
-    TORCH_CHECK(target_prob.dim() == 2, "target_prob must be 2D");
+__mlu_entry__ void kl_partial_kernel_fp16(const half *input_log_prob,
+                                          const half *target_prob,
+                                          float *partial,
+                                          int total) {
+    int chunk = (total + taskDim - 1) / taskDim;
+    int start = taskId * chunk;
+    int end = start + chunk;
+    if (end > total) {
+        end = total;
+    }
+
+    float sum = 0.0f;
+
+    for (int i = start; i < end; ++i) {
+        float target = (float)target_prob[i];
+
+        // PyTorch KLDivLoss 中 target == 0 时贡献为 0
+        if (target > 0.0f) {
+            float input = (float)input_log_prob[i];
+            sum += target * (logf(target) - input);
+        }
+    }
+
+    partial[taskId] = sum;
+}
+
+__mlu_entry__ void kl_final_kernel_fp16(const float *partial,
+                                        half *out,
+                                        int partial_count,
+                                        int batch) {
+    float sum = 0.0f;
+
+    for (int i = 0; i < partial_count; ++i) {
+        sum += partial[i];
+    }
+
+    // reduction = batchmean
+    float result = sum / (float)batch;
+    out[0] = (half)result;
+}
+
+torch::Tensor bang_func(torch::Tensor input_log_prob,
+                        torch::Tensor target_prob) {
+    TORCH_CHECK(input_log_prob.dim() == 2,
+                "input_log_prob must be 2D, shape [batch, N]");
+    TORCH_CHECK(target_prob.dim() == 2,
+                "target_prob must be 2D, shape [batch, N]");
     TORCH_CHECK(input_log_prob.sizes() == target_prob.sizes(),
                 "input_log_prob and target_prob must have same shape");
     TORCH_CHECK(input_log_prob.scalar_type() == torch::kFloat16,
@@ -10,22 +58,44 @@ torch::Tensor bang_func(torch::Tensor input_log_prob, torch::Tensor target_prob)
     TORCH_CHECK(target_prob.scalar_type() == torch::kFloat16,
                 "target_prob must be float16");
 
-    int64_t batch = input_log_prob.size(0);
+    auto input_c = input_log_prob.contiguous();
+    auto target_c = target_prob.contiguous();
 
-    auto input = input_log_prob.contiguous();
-    auto target = target_prob.contiguous();
+    int batch = static_cast<int>(input_c.size(0));
+    int N = static_cast<int>(input_c.size(1));
+    int total = batch * N;
 
-    auto zero = torch::zeros_like(target);
+    uint32_t task_num = 64;
+    if (total < static_cast<int>(task_num)) {
+        task_num = static_cast<uint32_t>(total);
+    }
+    if (task_num == 0) {
+        task_num = 1;
+    }
 
-    // target == 0 时 KL 项按 0 处理，避免 0 * log(0) 产生 NaN
-    auto kl_terms = torch::where(
-        target > 0,
-        target * (torch::log(target) - input),
-        zero
-    );
+    auto partial = torch::empty({static_cast<int64_t>(task_num)},
+                                input_c.options().dtype(torch::kFloat32));
 
-    // batchmean: sum over all elements / batch
-    auto out = kl_terms.sum() / batch;
+    // dtype 保持 float16
+    auto out = torch::empty({}, input_c.options().dtype(torch::kFloat16));
+
+    cnrtDim3_t dim = {task_num, 1, 1};
+    cnrtDim3_t one = {1, 1, 1};
+
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    kl_partial_kernel_fp16<<<dim, ktype, queue>>>(
+        reinterpret_cast<const half *>(input_c.data_ptr()),
+        reinterpret_cast<const half *>(target_c.data_ptr()),
+        reinterpret_cast<float *>(partial.data_ptr()),
+        total);
+
+    kl_final_kernel_fp16<<<one, ktype, queue>>>(
+        reinterpret_cast<const float *>(partial.data_ptr()),
+        reinterpret_cast<half *>(out.data_ptr()),
+        static_cast<int>(task_num),
+        batch);
 
     return out;
 }
