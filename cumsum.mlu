@@ -3,28 +3,55 @@
 #include <stdint.h>
 #include <torch/extension.h>
 
+#define MAX_DIM 16384
+#define ALIGN_NUM 64
+
+__mlu_func__ int align_up(int x, int a) {
+    return (x + a - 1) / a * a;
+}
+
 __mlu_entry__ void cumsum_kernel(const half *input,
                                  half *output,
                                  int outer,
                                  int dim_size,
                                  int inner) {
+    __nram__ half nram_h[MAX_DIM];
+    __nram__ float nram_f[MAX_DIM];
     __nram__ half nram_val[1];
     __nram__ half nram_out[1];
 
-    int total = outer * inner;
+    if (inner == 1) {
+        for (int o = taskId; o < outer; o += taskDim) {
+            __memcpy(nram_h, input + (int64_t)o * dim_size,
+                     dim_size * sizeof(half), GDRAM2NRAM);
 
-    for (int idx = taskId; idx < total; idx += taskDim) {
-        int o = idx / inner;
-        int i = idx % inner;
+            float running_sum = 0.0f;
+            for (int d = 0; d < dim_size; ++d) {
+                running_sum += (float)nram_h[d];
+                nram_h[d] = (half)running_sum;
+            }
 
-        float running_sum = 0.0f;
+            __memcpy(output + (int64_t)o * dim_size, nram_h,
+                     dim_size * sizeof(half), NRAM2GDRAM);
+        }
+    } else {
+        int total = outer * inner;
+        for (int idx = taskId; idx < total; idx += taskDim) {
+            int o = idx / inner;
+            int i = idx % inner;
 
-        for (int d = 0; d < dim_size; ++d) {
-            int64_t pos = ((int64_t)o * dim_size + d) * inner + i;
-            __memcpy(nram_val, input + pos, sizeof(half), GDRAM2NRAM);
-            running_sum += (float)nram_val[0];
-            nram_out[0] = (half)running_sum;
-            __memcpy(output + pos, nram_out, sizeof(half), NRAM2GDRAM);
+            const half *base_in = input + (int64_t)o * dim_size * inner + i;
+            half *base_out = output + (int64_t)o * dim_size * inner + i;
+
+            float running_sum = 0.0f;
+            for (int d = 0; d < dim_size; ++d) {
+                __memcpy(nram_val, base_in + (int64_t)d * inner,
+                         sizeof(half), GDRAM2NRAM);
+                running_sum += (float)nram_val[0];
+                nram_out[0] = (half)running_sum;
+                __memcpy(base_out + (int64_t)d * inner, nram_out,
+                         sizeof(half), NRAM2GDRAM);
+            }
         }
     }
 }
