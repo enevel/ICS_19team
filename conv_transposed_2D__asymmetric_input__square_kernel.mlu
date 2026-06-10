@@ -5,10 +5,11 @@
 
 #define MAX_W 4096
 #define MAX_KS2 64
+#define MAX_IC_WEIGHTS 4096
 
 __mlu_entry__ void conv_transpose2d_kernel(const half *x,
                                            const half *weight,
-                                           half *output,
+                                           float *output,
                                            int batch,
                                            int in_channels,
                                            int out_channels,
@@ -23,9 +24,9 @@ __mlu_entry__ void conv_transpose2d_kernel(const half *x,
                                            int padding,
                                            int groups) {
     __nram__ half nram_x_row[MAX_W];
-    __nram__ half nram_w[MAX_KS2];
+    __nram__ half nram_w_all[MAX_IC_WEIGHTS];
     __nram__ float nram_acc[MAX_W];
-    __nram__ half nram_out_h[MAX_W];
+    __nram__ float nram_out_f[MAX_W];
 
     int ks2 = kernel_size * kernel_size;
     int total_tasks = batch * out_channels;
@@ -35,6 +36,13 @@ __mlu_entry__ void conv_transpose2d_kernel(const half *x,
         int oc = task % out_channels;
         int g = oc / oc_per_group;
         int oc_local = oc % oc_per_group;
+
+        for (int ic_l = 0; ic_l < ic_per_group; ++ic_l) {
+            int ic = g * ic_per_group + ic_l;
+            __memcpy(nram_w_all + ic_l * ks2,
+                     weight + ((int64_t)ic * oc_per_group + oc_local) * ks2,
+                     ks2 * sizeof(half), GDRAM2NRAM);
+        }
 
         for (int oh = 0; oh < h_out; ++oh) {
             for (int ow_start = 0; ow_start < w_out; ow_start += MAX_W) {
@@ -47,10 +55,7 @@ __mlu_entry__ void conv_transpose2d_kernel(const half *x,
 
                 for (int ic_l = 0; ic_l < ic_per_group; ++ic_l) {
                     int ic = g * ic_per_group + ic_l;
-
-                    __memcpy(nram_w,
-                             weight + ((int64_t)ic * oc_per_group + oc_local) * ks2,
-                             ks2 * sizeof(half), GDRAM2NRAM);
+                    const half *nram_w = nram_w_all + ic_l * ks2;
 
                     for (int kh = 0; kh < kernel_size; ++kh) {
                         int h_tmp = oh + padding - kh;
@@ -77,13 +82,9 @@ __mlu_entry__ void conv_transpose2d_kernel(const half *x,
                     }
                 }
 
-                for (int t = 0; t < cur_w; ++t) {
-                    nram_out_h[t] = (half)nram_acc[t];
-                }
-
-                half *dst = output + ((int64_t)b * out_channels + oc) * h_out * w_out
+                float *dst = output + ((int64_t)b * out_channels + oc) * h_out * w_out
                           + oh * w_out + ow_start;
-                __memcpy(dst, nram_out_h, cur_w * sizeof(half), NRAM2GDRAM);
+                __memcpy(dst, nram_acc, cur_w * sizeof(float), NRAM2GDRAM);
             }
         }
     }
@@ -113,7 +114,7 @@ torch::Tensor bang_func(torch::Tensor x,
     int ic_per_group = in_channels / groups;
 
     auto output = torch::zeros({batch, out_channels, h_out, w_out},
-                               x_c.options().dtype(torch::kHalf));
+                               x_c.options().dtype(torch::kFloat32));
 
     int total_tasks = batch * out_channels;
     if (total_tasks == 0) {
@@ -132,7 +133,7 @@ torch::Tensor bang_func(torch::Tensor x,
     conv_transpose2d_kernel<<<dim, ktype, queue>>>(
         reinterpret_cast<const half *>(x_c.data_ptr()),
         reinterpret_cast<const half *>(w_c.data_ptr()),
-        reinterpret_cast<half *>(output.data_ptr()),
+        reinterpret_cast<float *>(output.data_ptr()),
         batch, in_channels, out_channels,
         h_in, w_in, h_out, w_out,
         oc_per_group, ic_per_group,
